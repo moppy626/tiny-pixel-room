@@ -17353,6 +17353,7 @@ var headers = (token) => ({
   "user-agent": "tiny-pixel-room"
 });
 var failure = (message, fields = {}) => Object.assign(new Error(message), fields);
+var UNREADABLE_RESPONSE = bilingual("GitHub API \u306E\u5FDC\u7B54\u3092\u8AAD\u3081\u307E\u305B\u3093\u3067\u3057\u305F", "Couldn't read the GitHub API response");
 function httpError(status, body, fields = {}) {
   const reason = body?.message ? `: ${body.message}` : "";
   return failure(bilingual(`GitHub API \u304C ${status} \u3092\u8FD4\u3057\u307E\u3057\u305F${reason}`, `GitHub API returned ${status}${reason}`), { status, ...fields });
@@ -17390,7 +17391,7 @@ async function send(url, init) {
   try {
     body = JSON.parse(text);
   } catch {
-    if (ok) throw failure(bilingual("GitHub API \u306E\u5FDC\u7B54\u3092\u8AAD\u3081\u307E\u305B\u3093\u3067\u3057\u305F", "Couldn't read the GitHub API response"), { retryAfterMs: 0 });
+    if (ok) throw failure(UNREADABLE_RESPONSE, { retryAfterMs: 0 });
   }
   return { status, ok, headers: response.headers, body };
 }
@@ -17404,38 +17405,57 @@ function rateLimitWait(headers2) {
   else if (headers2.get("x-ratelimit-remaining") === "0") ms = Number(headers2.get("x-ratelimit-reset")) * 1e3 - Date.now();
   return ms <= RATE_LIMIT_WAIT_MS ? Math.max(ms, 0) : void 0;
 }
-async function graphql(token, query, variables) {
+var rateLimitFailure = (reason, headers2, fields = {}) => failure(rateLimitMessage(reason), { ...fields, retryAfterMs: rateLimitWait(headers2) });
+var isForbidden = (error) => error.type === "FORBIDDEN" || /not accessible/i.test(error.message);
+var isUnreadable = (error) => isForbidden(error) || error.type === "NOT_FOUND" || error.type === "INSUFFICIENT_SCOPES";
+function call(url, init, read) {
   return withRetry(async () => {
-    const response = await send(ENDPOINT, {
-      method: "POST",
-      headers: { ...headers(token), "content-type": "application/json" },
-      body: JSON.stringify({ query, variables })
-    });
+    const response = await send(url, init);
+    if (isRateLimited(response)) throw rateLimitFailure(response.status, response.headers, { status: response.status });
+    return read(response);
+  });
+}
+function request(token, query, variables, partial) {
+  const init = {
+    method: "POST",
+    headers: { ...headers(token), "content-type": "application/json" },
+    body: JSON.stringify({ query, variables })
+  };
+  return call(ENDPOINT, init, (response) => {
     const { status, ok, body } = response;
-    if (isRateLimited(response)) {
-      throw failure(rateLimitMessage(status), { status, retryAfterMs: rateLimitWait(response.headers) });
-    }
     if (!ok) throw httpError(status, body);
-    if (body.errors?.length) {
-      const message = body.errors.map((e) => e.message).join("; ");
-      if (body.errors.some((e) => e.type === "RATE_LIMITED")) {
-        throw failure(rateLimitMessage(message), { retryAfterMs: rateLimitWait(response.headers) });
-      }
-      const timedOut = body.errors.some((e) => /something went wrong|timeout|timed out/i.test(e.message));
-      throw failure(bilingual(`GitHub API \u304C\u30A8\u30E9\u30FC\u3092\u8FD4\u3057\u307E\u3057\u305F: ${message}`, `GitHub API returned an error: ${message}`), {
-        forbidden: body.errors.every((e) => e.type === "FORBIDDEN" || /not accessible/i.test(e.message)),
-        notFound: body.errors.every((e) => e.type === "NOT_FOUND"),
-        retryAfterMs: timedOut ? 0 : void 0
-      });
-    }
-    return body.data;
+    const errors = body?.errors ?? [];
+    if (body?.data == null && errors.length === 0) throw failure(UNREADABLE_RESPONSE, { retryAfterMs: 0 });
+    if (errors.length === 0) return { data: body.data, unreadable: false };
+    const shown2 = partial ? errors.filter((e) => !isUnreadable(e)) : errors;
+    const message = shown2.map((e) => e.message).join("; ");
+    if (errors.some((e) => e.type === "RATE_LIMITED")) throw rateLimitFailure(message, response.headers);
+    if (shown2.length === 0) return { data: body.data ?? {}, unreadable: true };
+    const timedOut = errors.some((e) => !isUnreadable(e) && /something went wrong|timeout|timed out/i.test(e.message));
+    throw failure(bilingual(`GitHub API \u304C\u30A8\u30E9\u30FC\u3092\u8FD4\u3057\u307E\u3057\u305F: ${message}`, `GitHub API returned an error: ${message}`), {
+      forbidden: errors.every(isForbidden),
+      notFound: errors.every((e) => e.type === "NOT_FOUND"),
+      retryAfterMs: timedOut ? 0 : void 0
+    });
+  });
+}
+var graphql = async (token, query, variables) => (await request(token, query, variables, false)).data;
+var graphqlPartial = (token, query, variables) => request(token, query, variables, true);
+function restGet(token, path) {
+  const init = { headers: { ...headers(token), accept: "application/vnd.github+json" } };
+  return call(`https://api.github.com${path}`, init, ({ status, ok, body }) => {
+    if (status === 403 || status === 404) return null;
+    if (!ok) throw httpError(status, body);
+    return body;
   });
 }
 var PROFILE_QUERY = `query ($login: String!) {
   user(login: $login) {
+    id
     contributionsCollection {
       contributionYears
       totalCommitContributions
+      restrictedContributionsCount
       contributionCalendar { weeks { contributionDays { date } } }
     }
   }
@@ -17444,6 +17464,7 @@ function lastDate(calendar) {
   const lastWeek = calendar.weeks.at(-1)?.contributionDays ?? [];
   return lastWeek.at(-1)?.date;
 }
+var firstDate = (calendar) => calendar.weeks.find((week) => week.contributionDays.length > 0)?.contributionDays[0].date;
 var countQuery = (field) => `query ($login: String!) { user(login: $login) { ${field} { totalCount } } }`;
 var OWNED_QUERY = `query ($login: String!, $after: String) {
   user(login: $login) {
@@ -17461,6 +17482,45 @@ var LANGUAGES_QUERY = `query ($login: String!, $after: String) {
       nodes {
         languages(first: 10, orderBy: { field: SIZE, direction: DESC }) {
           edges { size node { name } }
+        }
+      }
+    }
+  }
+}`;
+var PRIVATE_REPOSITORIES_PER_PAGE = 25;
+var COMMIT_COUNT = "target { ... on Commit { history(since: $since) { totalCount } } }";
+var VIEWER_QUERY = `query ($login: String!) {
+  viewer { id }
+  user(login: $login) {
+    contributionsCollection { commitContributionsByRepository(maxRepositories: 100) { repository { id } } }
+  }
+}`;
+var PRIVATE_REPOSITORIES_QUERY = `query ($login: String!, $after: String, $since: GitTimestamp!) {
+  user(login: $login) {
+    repositories(first: ${PRIVATE_REPOSITORIES_PER_PAGE}, after: $after, privacy: PRIVATE, isFork: false, ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], orderBy: { field: PUSHED_AT, direction: DESC }) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id pushedAt owner { login } name
+        defaultBranchRef { name ${COMMIT_COUNT} }
+        ghPages: ref(qualifiedName: "refs/heads/gh-pages") { ${COMMIT_COUNT} }
+      }
+    }
+  }
+}`;
+var HISTORY_QUERY = `query ($owner: String!, $name: String!, $ref: String!, $since: GitTimestamp!, $all: Boolean!, $author: CommitAuthor, $after: String) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $ref) {
+      target {
+        ... on Commit {
+          history(first: 100, after: $after, since: $since, author: $author) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              oid
+              author { date }
+              committer @include(if: $all) { user { id } }
+              authors(first: 100) @include(if: $all) { nodes { user { id } } }
+            }
+          }
         }
       }
     }
@@ -17501,59 +17561,239 @@ async function fetchContributions(login, token, years) {
   const totalContributions = collections.reduce((sum, c) => sum + c.contributionCalendar.totalContributions, 0);
   return { days, totalContributions };
 }
+async function* pages(fetchPage) {
+  let after = null;
+  do {
+    const page = await fetchPage(after);
+    yield page;
+    after = page?.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+  } while (after);
+}
+var userRepositories = (token, query, login) => async (after) => (await graphql(token, query, { login, after })).user.repositories;
 async function fetchOwned(login, token) {
   let stars = 0;
   let totalRepositories;
-  let after = null;
-  do {
-    const data = await graphql(token, OWNED_QUERY, { login, after });
-    const page = data.user.repositories;
+  for await (const page of pages(userRepositories(token, OWNED_QUERY, login))) {
     totalRepositories ??= page.totalCount;
     const counts = page.nodes.map((node) => node.stargazerCount);
     stars += counts.reduce((sum, count) => sum + count, 0);
-    after = page.pageInfo.hasNextPage && !counts.includes(0) ? page.pageInfo.endCursor : null;
-  } while (after);
+    if (counts.includes(0)) break;
+  }
   return { stars, totalRepositories };
 }
 async function fetchLanguages(login, token) {
   const repositories = [];
-  let after = null;
-  do {
-    const data = await graphql(token, LANGUAGES_QUERY, { login, after });
-    const page = data.user.repositories;
+  for await (const page of pages(userRepositories(token, LANGUAGES_QUERY, login))) {
     for (const node of page.nodes) {
       repositories.push({ languages: node.languages.edges.map((edge) => ({ name: edge.node.name, size: edge.size })) });
     }
-    after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-  } while (after);
+  }
   return repositories;
 }
-async function fetchAccount(login, token) {
+var REPOSITORY_CONCURRENCY = 4;
+var MAX_PRIVATE_REQUESTS = 200;
+var READINGS = ["all", "authored", "none"];
+var HEAVIER_READING_REQUESTS = MAX_PRIVATE_REQUESTS * 0.8;
+var readingLimit = (reading, previous) => READINGS.indexOf(reading) < READINGS.indexOf(previous) ? HEAVIER_READING_REQUESTS : MAX_PRIVATE_REQUESTS;
+function branchesOf(repository) {
+  const { defaultBranchRef: main2, ghPages } = repository;
+  const branches = [];
+  if (main2) branches.push({ ref: `refs/heads/${main2.name}`, commits: main2.target?.history?.totalCount });
+  if (ghPages && main2?.name !== "gh-pages") {
+    branches.push({ ref: "refs/heads/gh-pages", commits: ghPages.target?.history?.totalCount, site: true });
+  }
+  return branches.filter((branch) => branch.commits !== 0);
+}
+function listed(repository) {
+  const branches = branchesOf(repository);
+  const all = branches.reduce((sum, { commits }) => sum + Math.max(1, Math.ceil((commits ?? 0) / 100)), 0);
+  return { repository, branches, requests: { all, authored: branches.length } };
+}
+async function hasPagesSite(token, { owner: { login: owner }, name }) {
+  const repository = await restGet(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`);
+  return repository === null ? null : repository.has_pages === true;
+}
+async function forEachConcurrently(items, done, fn) {
+  const queue = [...items];
+  let failed = false;
+  const stopped = () => failed || done();
+  const worker = async () => {
+    while (!stopped() && queue.length > 0) {
+      try {
+        await fn(queue.shift(), stopped);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: REPOSITORY_CONCURRENCY }, worker));
+}
+var changedWhileCounting = (ja, en) => failure(bilingual(ja, en));
+var UNREADABLE_COMMITS = bilingual("\u975E\u516C\u958B\u30EA\u30DD\u30B8\u30C8\u30EA\u306E\u30B3\u30DF\u30C3\u30C8\u306E\u4E00\u90E8\u304C\u8AAD\u3081\u307E\u305B\u3093\u3067\u3057\u305F", "Some commits in a private repository couldn't be read");
+async function activePrivateRepositories(token, { login, since, counted, budget }) {
+  const repositories = /* @__PURE__ */ new Map();
+  let requests = 0;
+  let authored = 0;
+  let readable = true;
+  const overBudget = () => requests + authored > budget;
+  const fetchPage = async (after) => {
+    requests += 1;
+    const { data } = await graphqlPartial(token, PRIVATE_REPOSITORIES_QUERY, { login, since, after });
+    const page = data.user?.repositories;
+    if (page?.nodes) return page;
+    if (requests === 1) {
+      readable = false;
+      return null;
+    }
+    throw changedWhileCounting(
+      "\u975E\u516C\u958B\u30EA\u30DD\u30B8\u30C8\u30EA\u306E\u4E00\u89A7\u304C\u3001\u9014\u4E2D\u304B\u3089\u8AAD\u3081\u306A\u304F\u306A\u308A\u307E\u3057\u305F",
+      "The list of private repositories became unreadable partway through"
+    );
+  };
+  const readActive = async (maxPages) => {
+    let read = 0;
+    for await (const page of pages(fetchPage)) {
+      if (!page) return;
+      read += 1;
+      const old = page.nodes.findIndex((repository) => repository?.pushedAt && Date.parse(repository.pushedAt) < Date.parse(since));
+      for (const repository of old === -1 ? page.nodes : page.nodes.slice(0, old)) {
+        if (!repository?.pushedAt || repositories.has(repository.id) || counted.has(repository.id)) continue;
+        const entry = listed(repository);
+        repositories.set(repository.id, entry);
+        authored += entry.requests.authored;
+      }
+      if (old !== -1 || overBudget() || read === maxPages) return;
+    }
+  };
+  await readActive(Infinity);
+  if (!readable) return null;
+  if (requests > 1 && !overBudget()) await readActive(1);
+  return { repositories: [...repositories.values()], requests };
+}
+async function readRepository(token, { repository, branches }, { since, author }, stopped, onCommits) {
+  const { owner: { login: owner }, name } = repository;
+  let first = true;
+  const changed = () => changedWhileCounting(
+    "\u975E\u516C\u958B\u30EA\u30DD\u30B8\u30C8\u30EA\u306E\u30B3\u30DF\u30C3\u30C8\u3092\u6570\u3048\u3066\u3044\u308B\u3042\u3044\u3060\u306B\u3001\u30EA\u30DD\u30B8\u30C8\u30EA\u304B\u30D6\u30E9\u30F3\u30C1\u304C\u6D88\u3055\u308C\u305F\u304B\u3001\u540D\u524D\u304C\u5909\u308F\u3063\u305F\u304B\u3001\u8AAD\u3081\u306A\u304F\u306A\u308A\u307E\u3057\u305F",
+    "A private repository or branch was deleted, renamed or became unreadable while counting commits"
+  );
+  for (const { ref, site } of branches) {
+    if (stopped()) return;
+    if (site) {
+      const hasSite = await hasPagesSite(token, repository);
+      if (hasSite === null) {
+        if (first) return;
+        throw changed();
+      }
+      if (!hasSite) continue;
+      if (stopped()) return;
+    }
+    const fetchPage = async (after) => {
+      const variables = { owner, name, ref, since, all: !author, author, after };
+      const { data, unreadable } = await graphqlPartial(token, HISTORY_QUERY, variables);
+      const history = data.repository?.ref?.target?.history;
+      if (history?.nodes) return history;
+      if (first && (!data.repository || unreadable)) return null;
+      throw changed();
+    };
+    for await (const history of pages(fetchPage)) {
+      if (!history) return;
+      first = false;
+      if (history.nodes.includes(null)) throw failure(UNREADABLE_COMMITS);
+      onCommits(history.nodes);
+      if (stopped()) return;
+    }
+  }
+}
+var NOT_COUNTED = { count: 0, reading: "all" };
+async function fetchPrivateCommits(login, token, { id, firstDay, lastDay, restricted }, previous) {
+  if (token.startsWith("ghs_")) return NOT_COUNTED;
+  const { data } = await graphqlPartial(token, VIEWER_QUERY, { login });
+  if (data.viewer?.id !== id) return NOT_COUNTED;
+  const contributions = data.user?.contributionsCollection.commitContributionsByRepository ?? [];
+  const counted = new Set(contributions.map((contribution) => contribution.repository.id));
+  const since = `${addDays(firstDay, -1)}T00:00:00Z`;
+  const active = await activePrivateRepositories(token, { login, since, counted, budget: readingLimit("authored", previous) });
+  if (!active) return NOT_COUNTED;
+  const { repositories, requests } = active;
+  const estimate = (reading2) => requests + repositories.reduce((sum, entry) => sum + entry.requests[reading2], 0);
+  const reading = ["all", "authored"].find((candidate) => estimate(candidate) <= readingLimit(candidate, previous)) ?? "none";
+  if (reading === "none") return { count: 0, reading };
+  const author = reading === "all" ? null : { id };
+  const isContribution = (commit) => {
+    const day = commit.author?.date?.slice(0, 10);
+    if (!day || day < firstDay || day > lastDay) return false;
+    if (author) return true;
+    return commit.committer?.user?.id === id || (commit.authors?.nodes ?? []).some((person) => person?.user?.id === id);
+  };
+  let total = 0;
+  await forEachConcurrently(repositories, () => total >= restricted, async (entry, stopped) => {
+    const found = /* @__PURE__ */ new Set();
+    await readRepository(token, entry, { since, author }, stopped, (commits) => {
+      for (const commit of commits) {
+        if (!isContribution(commit) || found.has(commit.oid)) continue;
+        found.add(commit.oid);
+        total += 1;
+      }
+    });
+  });
+  return { count: Math.min(total, restricted), reading };
+}
+var isPrivateCommits = (value) => Number.isSafeInteger(value?.count) && value.count >= 0 && READINGS.includes(value.reading);
+var privateCommitsFallback = (recorded) => recorded ? bilingual(
+  "\u975E\u516C\u958B\u30EA\u30DD\u30B8\u30C8\u30EA\u306E\u30B3\u30DF\u30C3\u30C8\u3092\u6570\u3048\u304D\u308C\u306A\u304B\u3063\u305F\u306E\u3067\u3001\u524D\u306E\u5B9F\u884C\u3067\u6570\u3048\u305F\u6570\u3092\u4F7F\u3044\u307E\u3059\u3002\u6B21\u306E\u5B9F\u884C\u3067\u6570\u3048\u76F4\u3057\u307E\u3059",
+  "Couldn't count the commits in private repositories, so the count from the previous run is used. They will be counted again on the next run"
+) : bilingual(
+  "\u975E\u516C\u958B\u30EA\u30DD\u30B8\u30C8\u30EA\u306E\u30B3\u30DF\u30C3\u30C8\u3092\u6570\u3048\u304D\u308C\u306A\u304B\u3063\u305F\u306E\u3067\u3001\u4ECA\u56DE\u306F\u6570\u3048\u307E\u305B\u3093\u3002\u6B21\u306E\u5B9F\u884C\u3067\u6570\u3048\u76F4\u3057\u307E\u3059",
+  "Couldn't count the commits in private repositories, so they aren't counted this time. They will be counted again on the next run"
+);
+async function fetchAccount(login, token, { privateCommits: recorded, warn: warn2 = console.warn } = {}) {
   const profile = await graphql(token, PROFILE_QUERY, { login }).catch((error) => {
     if (error.notFound) return { user: null };
     throw error;
   });
   if (!profile.user) throw new Error(userNotFound(login));
   const collection = profile.user.contributionsCollection;
-  const today = lastDate(collection.contributionCalendar);
+  const calendar = collection.contributionCalendar;
+  const today = lastDate(calendar);
   if (!today) {
     throw new Error(bilingual("GitHub API \u306E\u5FDC\u7B54\u304B\u3089\u4ECA\u65E5\u306E\u65E5\u4ED8\u3092\u8AAD\u3081\u307E\u305B\u3093\u3067\u3057\u305F", "Couldn't read today's date from the GitHub API response"));
   }
-  const [contributions, owned, repositories, totalPullRequests, totalIssues] = await Promise.all([
+  const restricted = collection.restrictedContributionsCount;
+  const previous = isPrivateCommits(recorded) ? recorded : NOT_COUNTED;
+  const countPrivateCommits = async () => {
+    if (!(restricted > 0)) return NOT_COUNTED;
+    const period = { id: profile.user.id, firstDay: firstDate(calendar), lastDay: today, restricted };
+    try {
+      return await fetchPrivateCommits(login, token, period, previous.reading);
+    } catch (error) {
+      warn2(`${privateCommitsFallback(previous !== NOT_COUNTED)}
+${error.message}`);
+      return { ...previous, count: Math.min(previous.count, restricted) };
+    }
+  };
+  const [contributions, privateCommits, owned, repositories, totalPullRequests, totalIssues] = await Promise.all([
     fetchContributions(login, token, collection.contributionYears),
+    countPrivateCommits(),
     fetchOwned(login, token),
     fetchLanguages(login, token),
     fetchCount("pullRequests", login, token),
     fetchCount("issues", login, token)
   ]);
+  const notCounted = privateCommits.count === NOT_COUNTED.count && privateCommits.reading === NOT_COUNTED.reading;
   return {
     login,
     // 草の日付での今日。連続記録とキャラクターの開始日は、この日付で数える。
     today,
     ...contributions,
-    // 草の期間 (およそ過去 1 年) のコミットの数。非公開リポジトリのコミットは、Private contributions がオンでも
-    // 種類の分からない非公開の活動の合計にしか入らないので、ここには入らない。
-    totalCommits: collection.totalCommitContributions,
+    // コントリビューションの期間 (およそ過去 1 年) のコミットの数。公開リポジトリの分 (totalCommitContributions) に、
+    // Private contributions がオンで、トークンの持ち主が本人なら、トークンで読める非公開リポジトリの分を、リポジトリごとに数えて足す。
+    // 読めない非公開リポジトリの分は入らない。
+    totalCommits: collection.totalCommitContributions + privateCommits.count,
+    // state.json に残して、次の実行の fetchAccount に渡す、非公開リポジトリのコミットの数と読み方。
+    // 数えないときと同じなら undefined で、残さない。
+    privateCommits: notCounted ? void 0 : privateCommits,
     // 言語を数えるリポジトリ (フォークを除いたすべて)。
     repositories,
     totalPullRequests,
@@ -17572,6 +17812,10 @@ function nextState(previous, character, today) {
 }
 function recordExp(state, exp) {
   return { ...state, maxExp: Math.max(state.maxExp, exp) };
+}
+function recordPrivateCommits(state, privateCommits) {
+  const { privateCommits: _, ...rest } = state;
+  return privateCommits === void 0 ? rest : { ...rest, privateCommits };
 }
 var isExp = (value) => Number.isSafeInteger(value) && value >= 0;
 function parseState(text) {
@@ -17694,9 +17938,9 @@ async function main() {
       `${statePath} wasn't found, so the growth starts today. If you changed output-dir, move state.json from the old folder to keep the growth`
     ));
   }
-  const account = await fetchAccount(login, token);
+  const account = await fetchAccount(login, token, { privateCommits: previous?.privateCommits, warn });
   const started = nextState(previous, character, account.today);
-  const state = recordExp(started, expSince(account.days, started.since));
+  const state = recordPrivateCommits(recordExp(started, expSince(account.days, started.since)), account.privateCommits);
   const cards = buildCards(account, { character, exp: state.maxExp, petName: input("pet-name"), hide, motion, language, warn });
   await writeCards(outputDir, cards);
   await writeState(statePath, state);
