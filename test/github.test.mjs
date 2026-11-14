@@ -5,6 +5,8 @@ import {
   HISTORY_PAGE_SIZES,
   KEEP_PRIVATE_COMMITS_DAYS,
   LIGHTER_READING_DAYS,
+  MAX_COUNT_MS,
+  MAX_HISTORY_REQUESTS,
   MAX_PRIVATE_REQUESTS,
   RATE_LIMIT_WAIT_MS,
   RETRY_DELAYS_MS,
@@ -100,7 +102,7 @@ const commit = (oid, { date = '2026-11-05T12:00:00+09:00', as = 'author' } = {})
   const me = { user: { id: 'U_octocat' } };
   const other = { user: { id: 'U_other' } };
   const authors = { author: [me], 'co-author': [other, me], committer: [other], none: [other] }[as];
-  return { oid, author: { date }, committer: as === 'committer' ? me : other, authors: { nodes: authors } };
+  return { oid, author: { date, ...(as === 'author' ? me : other) }, committer: as === 'committer' ? me : other, authors: { nodes: authors } };
 };
 
 const historyPage = (commits, endCursor = null) => ({
@@ -774,9 +776,10 @@ test('リポジトリは読めても、ブランチや履歴が読めなけれ�
   assert.equal(retryTimer.wait.mock.calls.length, 0);
 });
 
-test('Co-authored-by の人が読めないコミットも、止まらずに committer で決める', async (t) => {
+// authors には git の author も入るが、authors が null になっても、author は別に取っているので数えられる。
+test('Co-authored-by の人が読めないコミットも、止まらずに author と committer で決める', async (t) => {
   const unreadableAuthors = (oid, as) => ({ ...commit(oid, { as }), authors: { nodes: null } });
-  const page = historyPage([unreadableAuthors('a', 'committer'), unreadableAuthors('b', 'none')]);
+  const page = historyPage([unreadableAuthors('a', 'committer'), unreadableAuthors('b', 'none'), unreadableAuthors('c', 'author')]);
   const errors = [tokenError(['repository', 'ref', 'target', 'history', 'nodes', 0, 'authors', 'nodes'])];
   stubApi(t, {
     profile: sharingProfile,
@@ -784,7 +787,9 @@ test('Co-authored-by の人が読めないコミットも、止まらずに comm
     history: histories({ 'team main': { ...page, errors } }),
   });
   const account = await fetchAccount('octocat', 'token');
-  assert.equal(account.totalCommits, 4);
+  assert.equal(account.totalCommits, 5);
+  // author の user は、だれのコミットも読むときにしか使わないので、そのときだけ取る。
+  assert.match(callsWith('history(first:')[0].query, /author \{ date user @include\(if: \$all\) \{ id \} \}/);
 });
 
 const unreadableRepository = { data: { repository: null }, errors: [{ ...samlError, path: ['repository'] }] };
@@ -1227,7 +1232,7 @@ test('数えきれない日が続いても、数えきれなくなった日か�
 });
 
 // 読み方は、次の実行で前より重い読み方にするかを決めるのに使うので残す。数えきれなくなった日も変えない。
-// だれのコミットも読む (all) ときは、数が 0 だと数えないときと同じになるが、それでも残して、次の実行でも古いと分かるようにする。
+// 数は 0 にするが、残して、次の実行でも古いと分かるようにする。
 for (const reading of ['authored', 'all']) {
   test(`数えきれなくなった日から決まった日数を過ぎたら、前の実行で数えた数を使わずに非公開リポジトリの分を足さない: 読み方 ${reading}`, async (t) => {
     stubApi(t, { profile: sharingProfile, privateRepositories: internal });
@@ -1247,6 +1252,7 @@ const heavyError = { data: null, errors: [{ message: 'Something went wrong while
 const tooHeavyResponses = [
   ['200 のままタイムアウトのエラーになる', () => Response.json(heavyError), /Something went wrong/],
   ['502 になる', () => Response.json({ message: 'failure' }, { status: 502 }), /GitHub API が 502 を返しました/],
+  ['504 になる', () => Response.json({ message: 'failure' }, { status: 504 }), /GitHub API が 504 を返しました/],
   ['応答が来ずにタイムアウトする', () => Promise.reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), /30 秒以内に応答がありませんでした/],
 ];
 const readsEveryone = histories({ 'a main': [[commit('1')]], 'b main': [[commit('2'), commit('3')]] });
@@ -1345,22 +1351,222 @@ test('本人が author のコミットだけを読むときは、重すぎても
 });
 
 // 重すぎたのではない失敗なら、ページを小さくしても読めるとは限らないので、小さくせずに、同じ大きさでやり直す。
-test('重すぎたのではない一時的な失敗なら、ページを小さくせずに、同じ大きさでやり直す', async (t) => {
-  let failed = false;
-  const respond = histories({ 'a main': [[commit('1')]] });
+// 一時的な失敗で小さくすると、そのブランチの残りのページも小さいまま読み、問い合わせが増える。
+for (const [kind, transient] of [
+  ['接続が切れる', () => Promise.reject(connectionReset())],
+  ['500 になる', () => Response.json({ message: 'failure' }, { status: 500 })],
+  ['503 になる', () => Response.json({ message: 'failure' }, { status: 503 })],
+]) {
+  test(`重すぎたのではない一時的な失敗なら、ページを小さくせずに、同じ大きさでやり直す: ${kind}`, async (t) => {
+    let failed = false;
+    const respond = histories({ 'a main': [[commit('1')]] });
+    stubApi(t, {
+      profile: sharingProfile,
+      privateRepositories: repositoriesPage([repo('a')]),
+      history: (body) => {
+        if (failed) return respond(body);
+        failed = true;
+        return transient();
+      },
+    });
+    const { account } = await fetchWithRecord(t);
+    assert.deepEqual(account.privateCommits, record(1, 'all'));
+    assert.deepEqual(pageReads(), Array(2).fill(`all main ${HISTORY_PAGE_SIZES[0]} null`));
+    assert.equal(recordedWaits().length, 1);
+  });
+}
+
+// ページを小さくしつづけると、見積もりの何倍もの問い合わせを送ることがある。
+// 一覧では 1 ページと見積もったブランチが、読むと終わらない (読んでいるあいだに増えつづけるなど) ときも同じ。
+test('履歴の問い合わせが上限を超えたら、重すぎたものとして、本人が author のコミットだけを読んで数え直す', async (t) => {
+  const endless = ({ variables: { after } }) => {
+    const index = after === null ? 0 : Number(after);
+    return Response.json(historyPage([commit(`x${index}`, { as: 'none' })], String(index + 1)));
+  };
   stubApi(t, {
     profile: sharingProfile,
     privateRepositories: repositoriesPage([repo('a')]),
-    history: (body) => {
-      if (failed) return respond(body);
-      failed = true;
-      return Promise.reject(connectionReset());
-    },
+    history: (body) => (body.variables.all ? endless(body) : histories({ 'a main': [[commit('1')]] })(body)),
+  });
+  const { account, warnings } = await fetchWithRecord(t);
+  assert.deepEqual(account.privateCommits, record(1, 'authored', { lighterSince: TODAY }));
+  assert.equal(authorFilters().filter((author) => author === null).length, MAX_HISTORY_REQUESTS);
+  assert.deepEqual(authorFilters().filter((author) => author !== null), [{ id: 'U_octocat' }]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], lighterReading);
+  assert.match(warnings[0], new RegExp(`履歴を読む問い合わせが ${MAX_HISTORY_REQUESTS} 回を超えました`));
+});
+
+// 上限は、ページを小さくして読み直した分も入れて数える。小さくするもとになった、重すぎた問い合わせは入れない。
+test('ページを小さくして読み直した問い合わせは、履歴の問い合わせの上限に入れ、小さくするもとになった問い合わせは入れない', async (t) => {
+  const [large] = HISTORY_PAGE_SIZES;
+  const endless = ({ variables: { first, after } }) => {
+    if (first === large) return Response.json(heavyError);
+    const index = after === null ? 0 : Number(after);
+    return Response.json(historyPage([commit(`x${index}`, { as: 'none' })], String(index + 1)));
+  };
+  stubApi(t, {
+    profile: sharingProfile,
+    privateRepositories: repositoriesPage([repo('a')]),
+    history: (body) => (body.variables.all ? endless(body) : histories({ 'a main': [[commit('1')]] })(body)),
   });
   const { account } = await fetchWithRecord(t);
+  assert.deepEqual(account.privateCommits, record(1, 'authored', { lighterSince: TODAY }));
+  // 最初の 1 回だけが大きいページで、残りはすべて小さくした大きさで読む。
+  const everyone = pageReads().filter((read) => read.startsWith('all '));
+  assert.equal(everyone.length, MAX_HISTORY_REQUESTS + 1);
+  assert.equal(everyone.filter((read) => read.startsWith(`all main ${large} `)).length, 1);
+});
+
+// 見積もりは最初のページの大きさで決める。上限は、どのブランチも 1 段小さくして読めるだけの数にしてある。
+// 小さくするもとになった問い合わせも数えると、ブランチの数だけ足りなくなる。
+test('見積もりが上限いっぱいでも、どのブランチも 1 段小さくすれば読めるなら、だれのコミットも読んで数える', async (t) => {
+  const [large] = HISTORY_PAGE_SIZES;
+  // 見積もりは、一覧の 1 回と、リポジトリごとに 1 回で、ちょうど上限。
+  const names = Array.from({ length: MAX_PRIVATE_REQUESTS - 1 }, (_, index) => `r${index}`);
+  const twoSmallerPages = ({ variables: { name, first, after } }) => {
+    if (first === large) return Response.json(heavyError);
+    if (after === null) return Response.json(historyPage([commit(`${name}-1`, { as: name === 'r0' ? 'author' : 'none' })], '1'));
+    return Response.json(historyPage([commit(`${name}-2`, { as: 'none' })]));
+  };
+  stubApi(t, {
+    profile: sharingProfile,
+    privateRepositories: repositoriesPage(names.map((name) => repo(name, { commits: large }))),
+    history: twoSmallerPages,
+  });
+  const { account, warnings } = await fetchWithRecord(t);
   assert.deepEqual(account.privateCommits, record(1, 'all'));
-  assert.deepEqual(pageReads(), Array(2).fill(`all main ${HISTORY_PAGE_SIZES[0]} null`));
-  assert.equal(recordedWaits().length, 1);
+  assert.deepEqual(warnings, []);
+  // リポジトリごとに、重すぎた 1 回と、小さくした 2 ページ。
+  assert.equal(pageReads().length, names.length * 3);
+});
+
+test('履歴の問い合わせの上限は、同時に読むリポジトリで分け合う', async (t) => {
+  const endless = ({ variables: { name, after } }) => {
+    const index = after === null ? 0 : Number(after);
+    return Response.json(historyPage([commit(`${name}${index}`, { as: 'none' })], String(index + 1)));
+  };
+  stubApi(t, {
+    profile: sharingProfile,
+    privateRepositories: repositoriesPage([repo('a'), repo('b')]),
+    history: (body) => (body.variables.all ? endless(body) : readsEveryone(body)),
+  });
+  const { account, warnings } = await fetchWithRecord(t);
+  assert.deepEqual(account.privateCommits, record(3, 'authored', { lighterSince: TODAY }));
+  const everyone = historyCalls().filter(({ all }) => all);
+  assert.equal(everyone.length, MAX_HISTORY_REQUESTS);
+  assert.ok(everyone.some(({ name }) => name === 'a'));
+  assert.ok(everyone.some(({ name }) => name === 'b'));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], lighterReading);
+});
+
+// 本人が author のコミットだけを読んでいるときは、それより軽い読み方がないので、数え直さない。
+test('本人が author のコミットだけを読んでいて履歴の問い合わせが上限を超えたら、数え直さずに、前の実行の数を使う', async (t) => {
+  stubApi(t, {
+    profile: sharingProfile,
+    privateRepositories: repositoriesPage([repo('huge', { commits: MAX_PRIVATE_REQUESTS * 100 })]),
+    history: ({ variables: { after } }) => {
+      const index = after === null ? 0 : Number(after);
+      return Response.json(historyPage([commit(`x${index}`, { date: '2025-01-01T00:00:00Z' })], String(index + 1)));
+    },
+  });
+  const { account, warnings } = await fetchWithRecord(t, record(3, 'authored'));
+  assert.deepEqual(account.privateCommits, failedToday(3, 'authored'));
+  assert.equal(historyCalls().length, MAX_HISTORY_REQUESTS);
+  assert.ok(authorFilters().every((author) => author !== null));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], usedRecord);
+  assert.match(warnings[0], new RegExp(`履歴を読む問い合わせが ${MAX_HISTORY_REQUESTS} 回を超えました`));
+});
+
+// 500 や 503 は、まず一時的な失敗として、同じ大きさでやり直す。やり直しても続くなら、重すぎて返しきれないのかもしれない。
+// 重すぎたものとしないと、500 や 503 を返しつづけるリポジトリがあるとき、ページを小さくすることも、軽い読み方で数え直すこともできない。
+for (const status of [500, 503]) {
+  const fails = () => Response.json({ message: 'failure' }, { status });
+
+  test(`やり直しても ${status} が続いたら、重すぎたものとして、ページを小さくして読み直す`, async (t) => {
+    const [large, medium] = HISTORY_PAGE_SIZES;
+    const respond = histories({ 'a main': [[commit('1'), commit('2', { as: 'co-author' })]] });
+    stubApi(t, {
+      profile: sharingProfile,
+      privateRepositories: repositoriesPage([repo('a')]),
+      history: (body) => (body.variables.first === large ? fails() : respond(body)),
+    });
+    const { account, warnings } = await fetchWithRecord(t);
+    assert.deepEqual(account.privateCommits, record(2, 'all'));
+    assert.deepEqual(pageReads(), [...Array(RETRY_DELAYS_MS.length + 1).fill(`all main ${large} null`), `all main ${medium} null`]);
+    assert.deepEqual(recordedWaits(), RETRY_DELAYS_MS);
+    assert.deepEqual(warnings, []);
+  });
+
+  test(`どの大きさでも、やり直しても ${status} が続いたら、本人が author のコミットだけを読んで数え直す`, async (t) => {
+    stubApi(t, {
+      profile: sharingProfile,
+      privateRepositories: repositoriesPage([repo('a')]),
+      history: (body) => (body.variables.all ? fails() : histories({ 'a main': [[commit('1')]] })(body)),
+    });
+    const { account, warnings } = await fetchWithRecord(t);
+    assert.deepEqual(account.privateCommits, record(1, 'authored', { lighterSince: TODAY }));
+    assert.deepEqual(pageReads(), [
+      ...HISTORY_PAGE_SIZES.flatMap((size) => Array(RETRY_DELAYS_MS.length + 1).fill(`all main ${size} null`)),
+      `authored main ${HISTORY_PAGE_SIZES[0]} null`,
+    ]);
+    assert.deepEqual(recordedWaits(), HISTORY_PAGE_SIZES.flatMap(() => RETRY_DELAYS_MS));
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], lighterReading);
+    assert.match(warnings[0], new RegExp(`GitHub API が ${status} を返しました`));
+  });
+}
+
+// 問い合わせの数が上限までても、重いページは 1 回に何十秒もかかる。ワークフローの timeout-minutes までに終わらないと、
+// カードも state.json も書けず、毎日同じところで止まる。
+const tookTooLong = new RegExp(`履歴を読むのに ${MAX_COUNT_MS / 1000} 秒を超えました`);
+
+test('履歴を読むのに時間がかかりすぎたら、重すぎたものとして、本人が author のコミットだけを読んで数え直す', async (t) => {
+  let now = 0;
+  const respond = histories({ 'a main': [[commit('1')], [commit('2')], [commit('3')]] });
+  stubApi(t, {
+    profile: sharingProfile,
+    privateRepositories: repositoriesPage([repo('a')]),
+    // だれのコミットも読む問い合わせだけが、1 回に上限と同じ時間かかる。
+    history: (body) => {
+      if (body.variables.all) now += MAX_COUNT_MS;
+      return respond(body);
+    },
+  });
+  t.mock.method(retryTimer, 'now', () => now);
+  const { account, warnings } = await fetchWithRecord(t);
+  // 数え直すときは、時間をはじめから測る。
+  assert.deepEqual(account.privateCommits, record(3, 'authored', { lighterSince: TODAY }));
+  const [large] = HISTORY_PAGE_SIZES;
+  assert.deepEqual(pageReads(), [
+    `all main ${large} null`, `all main ${large} 1`,
+    `authored main ${large} null`, `authored main ${large} 1`, `authored main ${large} 2`,
+  ]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], lighterReading);
+  assert.match(warnings[0], tookTooLong);
+});
+
+test('本人が author のコミットだけを読んでいて時間がかかりすぎたら、数え直さずに、前の実行の数を使う', async (t) => {
+  let now = 0;
+  const respond = histories({ 'huge main': [[commit('1')], [commit('2')], [commit('3')]] });
+  stubApi(t, {
+    profile: sharingProfile,
+    privateRepositories: repositoriesPage([repo('huge', { commits: MAX_PRIVATE_REQUESTS * 100 })]),
+    history: (body) => {
+      now += MAX_COUNT_MS;
+      return respond(body);
+    },
+  });
+  t.mock.method(retryTimer, 'now', () => now);
+  const { account, warnings } = await fetchWithRecord(t, record(3, 'authored'));
+  assert.deepEqual(account.privateCommits, failedToday(3, 'authored'));
+  assert.equal(historyCalls().length, 2);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], usedRecord);
+  assert.match(warnings[0], tookTooLong);
 });
 
 // 回数の上限なら、軽い読み方でも同じく数えられず、問い合わせを増やすだけ。
@@ -1575,6 +1781,19 @@ test('数えきれないと分かって中止したあとでも、受け取っ�
   held.send(malformedHistory);
   await assert.rejects(pending, TypeError);
   assert.equal(warn.mock.calls.length, 0);
+});
+
+// 数えないとき (本人のトークンでないときなど) は残さないが、数えて 0 だったときは、数えた数として残す。
+test('数えたコミットが 0 でも、数えた数として残す', async (t) => {
+  stubApi(t, {
+    profile: sharingProfile,
+    privateRepositories: repositoriesPage([repo('a')]),
+    history: histories({ 'a main': [[commit('1', { as: 'none' })]] }),
+  });
+  const { account, warnings } = await fetchWithRecord(t);
+  assert.equal(account.totalCommits, 3);
+  assert.deepEqual(account.privateCommits, record(0, 'all'));
+  assert.deepEqual(warnings, []);
 });
 
 test('前の実行で数えた数がなければ、数えきれなかった日は非公開リポジトリの分を足さず、数えた数として残しもしない', async (t) => {

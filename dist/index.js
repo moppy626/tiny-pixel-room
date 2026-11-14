@@ -17339,7 +17339,7 @@ var YEARS_PER_REQUEST = 5;
 var RETRY_DELAYS_MS = [3e3, 1e4];
 var TIMEOUT_MS = 3e4;
 var RATE_LIMIT_WAIT_MS = 6e4;
-var retryTimer = { wait: (ms, signal) => delay(ms, void 0, { signal }) };
+var retryTimer = { wait: (ms, signal) => delay(ms, void 0, { signal }), now: () => performance.now() };
 var UNAUTHORIZED_MESSAGE = bilingual(
   "github-token \u306E\u30C8\u30FC\u30AF\u30F3\u304C\u4F7F\u3048\u307E\u305B\u3093 (401)\u3002\u6709\u52B9\u671F\u9650\u304C\u5207\u308C\u3066\u3044\u308B\u304B\u3001\u53D6\u308A\u6D88\u3055\u308C\u3066\u3044\u307E\u3059\u3002\u81EA\u5206\u3067\u4F5C\u3063\u305F\u30C8\u30FC\u30AF\u30F3\u3092\u6E21\u3057\u3066\u3044\u308B\u3068\u304D\u306F\u3001\u30EF\u30FC\u30AF\u30D5\u30ED\u30FC\u306E github-token \u306E\u884C\u3092\u6D88\u3057\u3066\u3001\u65E2\u5B9A\u306E\u30C8\u30FC\u30AF\u30F3\u306B\u623B\u3057\u3066\u304F\u3060\u3055\u3044",
   "The github-token can't be used (401). It has expired or been revoked. If you're passing your own token, remove the github-token line from the workflow to go back to the default token"
@@ -17355,6 +17355,7 @@ var headers = (token) => ({
 var FetchFailure = class extends Error {
 };
 var failure = (message, fields = {}) => Object.assign(new FetchFailure(message), fields);
+var TOO_HEAVY_STATUSES = /* @__PURE__ */ new Set([502, 504]);
 var UNREADABLE_RESPONSE = bilingual("GitHub API \u306E\u5FDC\u7B54\u3092\u8AAD\u3081\u307E\u305B\u3093\u3067\u3057\u305F", "Couldn't read the GitHub API response");
 function httpError(status, body, fields = {}) {
   const reason = body?.message ? `: ${body.message}` : "";
@@ -17370,13 +17371,18 @@ async function withRetry(attempt, signal, { retryTooHeavy = true } = {}) {
     try {
       return await attempt();
     } catch (error) {
+      if (signal?.aborted) throw error;
       const retryable = error.retryAfterMs !== void 0 && (retryTooHeavy || !error.tooHeavy);
-      if (signal?.aborted || !retryable || i === RETRY_DELAYS_MS.length) throw error;
-      await retryTimer.wait(Math.max(error.retryAfterMs, RETRY_DELAYS_MS[i]), signal);
+      if (retryable && i < RETRY_DELAYS_MS.length) {
+        await retryTimer.wait(Math.max(error.retryAfterMs, RETRY_DELAYS_MS[i]), signal);
+        continue;
+      }
+      if (retryable && error.tooHeavyIfRepeated) error.tooHeavy = true;
+      throw error;
     }
   }
 }
-async function send(url, init, signal) {
+async function send(url, init, signal, heavy) {
   let response;
   let text;
   try {
@@ -17387,13 +17393,16 @@ async function send(url, init, signal) {
     if (signal?.aborted) throw signal.reason;
     const seconds = TIMEOUT_MS / 1e3;
     const reason = error.cause?.message ?? error.message;
-    const tooHeavy = error.name === "TimeoutError";
-    const message = tooHeavy ? bilingual(`GitHub API \u304B\u3089 ${seconds} \u79D2\u4EE5\u5185\u306B\u5FDC\u7B54\u304C\u3042\u308A\u307E\u305B\u3093\u3067\u3057\u305F`, `The GitHub API didn't respond within ${seconds} seconds`) : bilingual(`GitHub API \u306B\u63A5\u7D9A\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F: ${reason}`, `Couldn't connect to the GitHub API: ${reason}`);
-    throw failure(message, { retryAfterMs: 0, tooHeavy });
+    const timedOut = error.name === "TimeoutError";
+    const message = timedOut ? bilingual(`GitHub API \u304B\u3089 ${seconds} \u79D2\u4EE5\u5185\u306B\u5FDC\u7B54\u304C\u3042\u308A\u307E\u305B\u3093\u3067\u3057\u305F`, `The GitHub API didn't respond within ${seconds} seconds`) : bilingual(`GitHub API \u306B\u63A5\u7D9A\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F: ${reason}`, `Couldn't connect to the GitHub API: ${reason}`);
+    throw failure(message, { retryAfterMs: 0, tooHeavy: heavy && timedOut });
   }
   const { status, ok } = response;
   if (status === 401) throw failure(UNAUTHORIZED_MESSAGE, { status });
-  if (status >= 500) throw httpError(status, null, { retryAfterMs: 0, tooHeavy: true });
+  if (status >= 500) {
+    const tooHeavy = heavy && TOO_HEAVY_STATUSES.has(status);
+    throw httpError(status, null, { retryAfterMs: 0, tooHeavy, tooHeavyIfRepeated: heavy && !tooHeavy });
+  }
   let body = null;
   try {
     body = JSON.parse(text);
@@ -17415,9 +17424,9 @@ function rateLimitWait(headers2) {
 var rateLimitFailure = (reason, headers2, fields = {}) => failure(rateLimitMessage(reason), { ...fields, retryAfterMs: rateLimitWait(headers2) });
 var isForbidden = (error) => error.type === "FORBIDDEN" || /not accessible/i.test(error.message);
 var isUnreadable = (error) => isForbidden(error) || error.type === "NOT_FOUND" || error.type === "INSUFFICIENT_SCOPES";
-function call(url, init, read, signal, options) {
+function call(url, init, read, signal, { heavy = false, ...options } = {}) {
   return withRetry(async () => {
-    const response = await send(url, init, signal);
+    const response = await send(url, init, signal, heavy);
     if (isRateLimited(response)) throw rateLimitFailure(response.status, response.headers, { status: response.status });
     return read(response);
   }, signal, options);
@@ -17445,22 +17454,17 @@ function request(token, query, variables, partial, signal, options) {
       retryAfterMs: timedOut ? 0 : void 0,
       tooHeavy: timedOut
     });
-  }, signal, options);
+  }, signal, { ...options, heavy: true });
 }
 var graphql = async (token, query, variables) => (await request(token, query, variables, false)).data;
 var graphqlPartial = (token, query, variables, signal, options) => request(token, query, variables, true, signal, options);
-async function restGet(token, path, signal) {
+function restGet(token, path, signal) {
   const init = { headers: { ...headers(token), accept: "application/vnd.github+json" } };
-  try {
-    return await call(`https://api.github.com${path}`, init, ({ status, ok, body }) => {
-      if (status === 403 || status === 404) return null;
-      if (!ok) throw httpError(status, body);
-      return body;
-    }, signal);
-  } catch (error) {
-    if (error instanceof FetchFailure) error.tooHeavy = false;
-    throw error;
-  }
+  return call(`https://api.github.com${path}`, init, ({ status, ok, body }) => {
+    if (status === 403 || status === 404) return null;
+    if (!ok) throw httpError(status, body);
+    return body;
+  }, signal);
 }
 var PROFILE_QUERY = `query ($login: String!) {
   user(login: $login) {
@@ -17529,7 +17533,7 @@ var HISTORY_QUERY = `query ($owner: String!, $name: String!, $ref: String!, $sin
             pageInfo { hasNextPage endCursor }
             nodes {
               oid
-              author { date }
+              author { date user @include(if: $all) { id } }
               committer @include(if: $all) { user { id } }
               authors(first: 100) @include(if: $all) { nodes { user { id } } }
             }
@@ -17606,6 +17610,16 @@ async function fetchLanguages(login, token) {
 var REPOSITORY_CONCURRENCY = 4;
 var MAX_PRIVATE_REQUESTS = 200;
 var HISTORY_PAGE_SIZES = [100, 50, 25];
+var MAX_HISTORY_REQUESTS = MAX_PRIVATE_REQUESTS * 2;
+var MAX_COUNT_MS = 15e4;
+var tooManyHistoryRequests = () => failure(bilingual(
+  `\u975E\u516C\u958B\u30EA\u30DD\u30B8\u30C8\u30EA\u306E\u5C65\u6B74\u3092\u8AAD\u3080\u554F\u3044\u5408\u308F\u305B\u304C ${MAX_HISTORY_REQUESTS} \u56DE\u3092\u8D85\u3048\u307E\u3057\u305F`,
+  `Reading the history of private repositories took more than ${MAX_HISTORY_REQUESTS} requests`
+), { tooHeavy: true });
+var tookTooLong = () => failure(bilingual(
+  `\u975E\u516C\u958B\u30EA\u30DD\u30B8\u30C8\u30EA\u306E\u5C65\u6B74\u3092\u8AAD\u3080\u306E\u306B ${MAX_COUNT_MS / 1e3} \u79D2\u3092\u8D85\u3048\u307E\u3057\u305F`,
+  `Reading the history of private repositories took more than ${MAX_COUNT_MS / 1e3} seconds`
+), { tooHeavy: true });
 var READINGS = ["all", "authored", "none"];
 var HEAVIER_READING_REQUESTS = MAX_PRIVATE_REQUESTS * 0.8;
 var LIGHTER_READING_DAYS = 7;
@@ -17701,7 +17715,7 @@ async function activePrivateRepositories(token, { login, since, counted, budget 
   if (requests > 1 && !overBudget()) await readActive(1);
   return { repositories: [...repositories.values()], requests };
 }
-async function readRepository(token, { repository, branches }, { since, author, hasSite, signal }, onCommits) {
+async function readRepository(token, { repository, branches }, { since, author, hasSite, budget, signal }, onCommits) {
   const { owner: { login: owner }, name } = repository;
   const pageSizes = author ? HISTORY_PAGE_SIZES.slice(0, 1) : HISTORY_PAGE_SIZES;
   let first = true;
@@ -17718,6 +17732,9 @@ async function readRepository(token, { repository, branches }, { since, author, 
     let size = 0;
     const readHistory = async (after) => {
       for (; ; ) {
+        if (retryTimer.now() > budget.deadline) throw tookTooLong();
+        budget.sent += 1;
+        if (budget.sent > MAX_HISTORY_REQUESTS) throw tooManyHistoryRequests();
         const smaller = size + 1 < pageSizes.length;
         const variables = { owner, name, ref, since, all: !author, author, first: pageSizes[size], after };
         try {
@@ -17725,6 +17742,7 @@ async function readRepository(token, { repository, branches }, { since, author, 
         } catch (error) {
           if (!(smaller && error instanceof FetchFailure && error.tooHeavy)) throw error;
           size += 1;
+          budget.sent -= 1;
         }
       }
     };
@@ -17743,17 +17761,16 @@ async function readRepository(token, { repository, branches }, { since, author, 
     }
   }
 }
-var NOT_COUNTED = { count: 0, reading: "all" };
 async function fetchPrivateCommits(login, token, period, { previous, lighterSince, lighterOnFailure }, warn2) {
   const { id, firstDay, lastDay: today } = period;
-  if (token.startsWith("ghs_")) return NOT_COUNTED;
+  if (token.startsWith("ghs_")) return void 0;
   const { data } = await graphqlPartial(token, VIEWER_QUERY, { login });
-  if (data.viewer?.id !== id) return NOT_COUNTED;
+  if (data.viewer?.id !== id) return void 0;
   const contributions = data.user?.contributionsCollection.commitContributionsByRepository ?? [];
   const counted = new Set(contributions.map((contribution) => contribution.repository.id));
   const since = `${addDays(firstDay, -1)}T00:00:00Z`;
   const active = await activePrivateRepositories(token, { login, since, counted, budget: readingLimit("authored", previous) });
-  if (!active) return NOT_COUNTED;
+  if (!active) return void 0;
   const { repositories, requests } = active;
   const fits = (candidate) => estimateRequests(requests, repositories, candidate) <= readingLimit(candidate, previous);
   const reading = (lighterSince ? ["authored"] : ["all", "authored"]).find(fits) ?? "none";
@@ -17779,13 +17796,14 @@ async function countCommits(token, repositories, { id, firstDay, lastDay, restri
     const day = commit.author?.date?.slice(0, 10);
     if (!day || day < firstDay || day > lastDay) return false;
     if (author) return true;
-    return commit.committer?.user?.id === id || (commit.authors?.nodes ?? []).some((person) => person?.user?.id === id);
+    return commit.author?.user?.id === id || commit.committer?.user?.id === id || (commit.authors?.nodes ?? []).some((person) => person?.user?.id === id);
   };
   let total = 0;
+  const budget = { sent: 0, deadline: retryTimer.now() + MAX_COUNT_MS };
   try {
     await forEachConcurrently(repositories, async (entry, signal, stop) => {
       const found = /* @__PURE__ */ new Set();
-      await readRepository(token, entry, { since, author, hasSite, signal }, (commits) => {
+      await readRepository(token, entry, { since, author, hasSite, budget, signal }, (commits) => {
         for (const commit of commits) {
           if (!commit || !isContribution(commit) || found.has(commit.oid)) continue;
           found.add(commit.oid);
@@ -17814,7 +17832,7 @@ function privateCommitsFallback(previous, use, restricted) {
       "\u975E\u516C\u958B\u30EA\u30DD\u30B8\u30C8\u30EA\u306E\u30B3\u30DF\u30C3\u30C8\u3092\u6570\u3048\u304D\u308C\u306A\u304B\u3063\u305F\u306E\u3067\u3001\u4ECA\u56DE\u306F\u6570\u3048\u307E\u305B\u3093\u3002\u6B21\u306E\u5B9F\u884C\u3067\u6570\u3048\u76F4\u3057\u307E\u3059",
       "Couldn't count the commits in private repositories, so they aren't counted this time. They will be counted again on the next run"
     );
-    return { privateCommits: NOT_COUNTED, message: message2 };
+    return { privateCommits: void 0, message: message2 };
   }
   const { failedSince, lastUsed, usable } = use;
   if (!usable) {
@@ -17855,10 +17873,10 @@ async function fetchAccount(login, token, { privateCommits: recorded, warn: warn
   const previous = isPrivateCommits(recorded, id) ? recorded : void 0;
   const use = previous && previousUse(previous, today);
   const countPrivateCommits = async () => {
-    if (!(restricted > 0)) return NOT_COUNTED;
+    if (!(restricted > 0)) return void 0;
     const period = { id, firstDay: firstDate(calendar), lastDay: today, restricted };
     const readings = {
-      previous: previous?.reading ?? NOT_COUNTED.reading,
+      previous: previous?.reading ?? READINGS[0],
       // 軽い読み方で数え直した日から決まった日数のあいだは、だれのコミットも読まない。
       lighterSince: previous?.lighterSince && lighterUntil(previous.lighterSince) >= today ? previous.lighterSince : void 0,
       // 前の実行がだれのコミットも読んでいなければ、軽い読み方で数え直しても、前の実行より軽い読み方の数にはならない。
@@ -17866,8 +17884,8 @@ async function fetchAccount(login, token, { privateCommits: recorded, warn: warn
     };
     try {
       const counted = await fetchPrivateCommits(login, token, period, readings, warn2);
-      if (counted.reading === "none" && previous?.reading !== "none") warn2(NOT_READING);
-      if (counted.reading === "authored" && readings.previous === "all" && counted.lighterSince === void 0) warn2(AUTHORED_READING);
+      if (counted?.reading === "none" && previous?.reading !== "none") warn2(NOT_READING);
+      if (counted?.reading === "authored" && readings.previous === "all" && counted.lighterSince === void 0) warn2(AUTHORED_READING);
       return counted;
     } catch (error) {
       if (!(error instanceof FetchFailure)) throw error;
@@ -17885,7 +17903,6 @@ ${error.message}`);
     fetchCount("pullRequests", login, token),
     fetchCount("issues", login, token)
   ]);
-  const notCounted = privateCommits.count === NOT_COUNTED.count && privateCommits.reading === NOT_COUNTED.reading && privateCommits.failedSince === void 0;
   return {
     login,
     // 草の日付での今日。連続記録とキャラクターの開始日は、この日付で数える。
@@ -17894,11 +17911,11 @@ ${error.message}`);
     // コントリビューションの期間 (およそ過去 1 年) のコミットの数。公開リポジトリの分 (totalCommitContributions) に、
     // Private contributions がオンで、トークンの持ち主が本人なら、トークンで読める非公開リポジトリの分を、リポジトリごとに数えて足す。
     // 読めない非公開リポジトリの分は入らない。
-    totalCommits: collection.totalCommitContributions + privateCommits.count,
+    totalCommits: collection.totalCommitContributions + (privateCommits?.count ?? 0),
     // state.json に残して、次の実行の fetchAccount に渡す、非公開リポジトリのコミットの数と読み方と数えた人 (userId)。
     // 数えきれなかった日は、数えきれなくなった日 (failedSince) も残す。軽い読み方で数え直したら、その日 (lighterSince) も、
-    // だれのコミットも読まないあいだ残す。数えないときと同じなら undefined で、残さない。
-    privateCommits: notCounted ? void 0 : { ...privateCommits, userId: id },
+    // だれのコミットも読まないあいだ残す。数えないときは undefined で、残さない。数えて 0 だったときは残す。
+    privateCommits: privateCommits && { ...privateCommits, userId: id },
     // 言語を数えるリポジトリ (フォークを除いたすべて)。
     repositories,
     totalPullRequests,
