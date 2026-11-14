@@ -6,7 +6,7 @@ import { buildCards, findInputError, parseHide, writeCards } from './card.mjs';
 import { fetchAccount } from './github.mjs';
 import { DEFAULT_LANGUAGE } from './growth.mjs';
 import { NAME, bilingual, encodeCommand } from './messages.mjs';
-import { nextState, readState, recordExp, writeState } from './state.mjs';
+import { nextState, readState, recordExp, recordPrivateCommits, writeState } from './state.mjs';
 import { expSince } from './stats.mjs';
 
 const PUSH_ATTEMPTS = 3;
@@ -123,9 +123,9 @@ async function main() {
     ));
   }
 
-  const account = await fetchAccount(login, token);
+  const account = await fetchAccount(login, token, { privateCommits: previous?.privateCommits, warn });
   const started = nextState(previous, character, account.today);
-  const state = recordExp(started, expSince(account.days, started.since));
+  const state = recordPrivateCommits(recordExp(started, expSince(account.days, started.since)), account.privateCommits);
   const cards = buildCards(account, { character, exp: state.maxExp, petName: input('pet-name'), hide, motion, language, warn });
 
   await writeCards(outputDir, cards);

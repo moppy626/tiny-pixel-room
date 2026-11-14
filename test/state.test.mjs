@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { nextState, readState, recordExp } from '../src/state.mjs';
+import { nextState, readState, recordExp, recordPrivateCommits } from '../src/state.mjs';
 
 function stateFile(t, text) {
   const dir = mkdtempSync(join(tmpdir(), 'tiny-pixel-room-'));
@@ -83,4 +83,17 @@ test('草の数が減って EXP が下がっても、最高 EXP は下げない'
 
 test('初めて使う日の EXP も、最高 EXP として覚える', () => {
   assert.equal(recordExp(nextState(null, 'turnip', '2026-11-08'), 42).maxExp, 42);
+});
+
+test('非公開リポジトリのコミットの数と読み方と数えた人と数えきれなくなった日を残し、なければ消す', () => {
+  const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 0 };
+  const privateCommits = { count: 5, reading: 'authored', userId: 'U_octocat', failedSince: '2026-05-08' };
+  assert.deepEqual(recordPrivateCommits(state, privateCommits), { ...state, privateCommits });
+  assert.deepEqual(recordPrivateCommits({ ...state, privateCommits }, undefined), state);
+});
+
+// 形の違う privateCommits は fetchAccount がないものとして扱い、次に残すときに直す。育ちには関係しないので止めない。
+test('privateCommits の形が違っても、state.json は読む', async (t) => {
+  const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 0, privateCommits: 'broken' };
+  assert.deepEqual(await readState(stateFile(t, JSON.stringify(state))), state);
 });

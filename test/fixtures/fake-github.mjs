@@ -20,9 +20,20 @@ function respond(query) {
     const collection = {
       contributionYears: [2026],
       totalCommitContributions: 30,
+      // Private contributions がオンの人。非公開リポジトリのコミットを数える前の、トークンの持ち主を確かめる問い合わせも通る。
+      restrictedContributionsCount: 12,
       contributionCalendar: calendar,
     };
-    return { data: { user: { contributionsCollection: collection } } };
+    return { data: { user: { id: 'U_fake', contributionsCollection: collection } } };
+  }
+  // トークンの持ち主。ふだんは本人ではないので、非公開リポジトリのコミットは数えない。
+  // FAKE_GITHUB=private-error なら本人で、非公開リポジトリの一覧を読むと、数えきれないエラーになる。
+  if (query.includes('viewer {')) {
+    const viewer = { id: process.env.FAKE_GITHUB === 'private-error' ? 'U_fake' : 'BOT_fake' };
+    return { data: { viewer, user: { contributionsCollection: { commitContributionsByRepository: [] } } } };
+  }
+  if (query.includes('privacy: PRIVATE')) {
+    return { data: null, errors: [{ type: 'INTERNAL', message: 'boom' }] };
   }
   if (query.includes('languages(')) {
     const languages = { edges: [{ size: 100, node: { name: 'JavaScript' } }] };
