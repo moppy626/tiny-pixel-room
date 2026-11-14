@@ -5,7 +5,7 @@ import { CHARACTERS } from './growth.mjs';
 import { bilingual } from './messages.mjs';
 import { addDays, isDate } from './stats.mjs';
 
-// today は草の日付での今日。
+// today はコントリビューションのグラフの日付での今日。
 export function nextState(previous, character, today) {
   if (previous?.character === character && previous.since) return previous;
   // 変えた日の活動を数えると、新しいキャラクターが 0 から始まらないので翌日から数える。
@@ -13,19 +13,10 @@ export function nextState(previous, character, today) {
   return { version: 1, character, since: previous ? addDays(today, 1) : today, maxExp: 0 };
 }
 
-// 草の数は減ることがある (Private contributions をオフにした、リポジトリを消したなど)。
+// contributions の数は減ることがある (Private contributions をオフにした、リポジトリを消したなど)。
 // 育った姿が戻らないよう、これまでの最高 EXP を覚えておき、それより下げない。
 export function recordExp(state, exp) {
   return { ...state, maxExp: Math.max(state.maxExp, exp) };
-}
-
-// 非公開リポジトリのコミットの数と読み方と数えた人、数えきれなかった日は数えきれなくなった日、
-// 軽い読み方で数え直したあとはその日 (github.mjs の fetchAccount が返す privateCommits) を残す。
-// 次の実行で fetchAccount に渡し、数えきれなかった日に前の数を使うのと、読み方を実行ごとに揺らさないのに使う。
-// 育ちには関係しないので、キャラクターを変えても引き継ぐ。undefined なら残さない。
-export function recordPrivateCommits(state, privateCommits) {
-  const { privateCommits: _, ...rest } = state;
-  return privateCommits === undefined ? rest : { ...rest, privateCommits };
 }
 
 const isExp = (value) => Number.isSafeInteger(value) && value >= 0;
@@ -60,7 +51,11 @@ export async function readState(path) {
   return state;
 }
 
+// v1.0.1 は、非公開リポジトリのコミットの数 (privateCommits) も残していた。
+// 書き出すところで落とすので、state がどこから来ても、公開リポジトリにある state.json に、使わない非公開の数が戻らない。
+// ほかの項目は、知らないものもそのまま残す。
 export async function writeState(path, state) {
+  const { privateCommits: _, ...kept } = state;
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
+  await writeFile(path, `${JSON.stringify(kept, null, 2)}\n`);
 }

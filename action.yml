@@ -11,6 +11,9 @@ inputs:
   github-token:
     description: GitHub API の読み取りに使うトークン。既定のままにしてください。カードの push には actions/checkout の認証情報を使います / The token used to read the GitHub API. Keep the default. The card is pushed with the actions/checkout credentials
     default: ${{ github.token }}
+  contributions-token:
+    description: コントリビューションの数 (Total contributions、Contrib (1yr)、連続記録、EXP) の読み取りに使うトークン。既定のままにしてください / The token used to read contribution counts (Total contributions, Contrib (1yr), streaks, and EXP). Keep the default
+    default: ${{ github.token }}
   username:
     description: カードに表示する GitHub ユーザー名 / The GitHub username shown on the card
     default: ${{ github.repository_owner }}
@@ -21,7 +24,7 @@ inputs:
     description: キャラクターの名前 (10 文字まで)。空なら種類名になります / The character's name, up to 10 characters. If empty, the kind name is used
     default: ''
   hide:
-    description: 隠す項目をカンマ区切りで指定 (contrib, current, longest, langs, stars, commits, prs, issues, repos)。残った項目は詰めて並べます。all ですべて隠し、キャラクターだけの細いカードになります / Items to hide, separated by commas (contrib, current, longest, langs, stars, commits, prs, issues, repos). The remaining items move up. all hides every item for a narrow card with just the character
+    description: 隠す項目をカンマ区切りで指定 (contrib, current, longest, langs, stars, contrib1yr, prs, issues, repos)。残った項目は詰めて並べます。all ですべて隠し、キャラクターだけの細いカードになります / Items to hide, separated by commas (contrib, current, longest, langs, stars, contrib1yr, prs, issues, repos). The remaining items move up. all hides every item for a narrow card with just the character
     default: ''
   language:
     description: カードの言葉とキャラクターの名前 (ja / en)。変えても成長はリセットされません / The card text and the character's name (ja / en). Changing it doesn't reset the growth

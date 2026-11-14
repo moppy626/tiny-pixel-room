@@ -20,7 +20,7 @@ function countsByDate(days) {
   return counts;
 }
 
-// today は草の日付での今日 (fetchAccount の today)。
+// today はコントリビューションのグラフの日付での今日 (fetchAccount の today)。
 export function computeStreaks(days, today) {
   const counts = countsByDate(days);
   const active = [...counts.keys()].filter((date) => counts.get(date) > 0).sort();

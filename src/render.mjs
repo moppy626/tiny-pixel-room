@@ -251,8 +251,9 @@ function statusSections({ c, write, font, stats, show }) {
 
   const numbers = [
     { key: 'stars', label: 'Stars earned', value: stats.stars, fill: c.gold },
-    // コミットは過去 1 年分なので、そうと分かる名前にする。数字と重ならないよう、半角 13 文字までにする。
-    { key: 'commits', label: 'Commits (1yr)', value: stats.commits, fill: c.text },
+    // プロフィールのコントリビューションのグラフと同じ、過去 1 年の contributions の合計。
+    // 全期間の Total contributions と区別できるよう (1yr) を付ける。数字と重ならないよう、半角 13 文字までにする。
+    { key: 'contrib1yr', label: 'Contrib (1yr)', value: stats.yearContributions, fill: c.text },
     { key: 'prs', label: 'Total PRs', value: stats.pullRequests, fill: c.text },
     { key: 'issues', label: 'Total issues', value: stats.issues, fill: c.text },
     { key: 'repos', label: 'Repositories', value: stats.repositories, fill: c.text },

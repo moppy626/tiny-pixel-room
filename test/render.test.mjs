@@ -14,7 +14,7 @@ const account = {
   days: [{ date: '2026-11-07', count: 5 }, { date: '2026-11-08', count: 3 }],
   repositories: [{ stars: 2, languages: [{ name: 'Go', size: 10 }] }],
   totalContributions: 2486,
-  totalCommits: 1874,
+  yearContributions: 1874,
   totalPullRequests: 126,
   totalIssues: 58,
   totalRepositories: 37,
@@ -401,7 +401,7 @@ test('何も隠さなければ、数字は 3 行に並び、右の列の 2 つ�
 
 test('隠した数字の項目は、前から詰めて並べる', () => {
   const svg = layoutOf(['stars']);
-  assert.ok(svg.includes('d="Commits (1yr)@408,208"'));
+  assert.ok(svg.includes('d="Contrib (1yr)@408,208"'));
   assert.ok(svg.includes('d="Total PRs@620,208"'));
   assert.ok(svg.includes('d="Total issues@408,236"'));
   assert.ok(svg.includes('d="Repositories@620,236"'));
@@ -413,7 +413,7 @@ test('隠した数字の項目は、前から詰めて並べる', () => {
 });
 
 test('数字の項目をすべて隠すと、ステータスの枠が縮み、その分だけ言語の枠が伸びる', () => {
-  const svg = layoutOf(['stars', 'commits', 'prs', 'issues', 'repos']);
+  const svg = layoutOf(['stars', 'contrib1yr', 'prs', 'issues', 'repos']);
   assert.ok(svg.includes(rightPanel(28, 168)));
   assert.ok(svg.includes(rightPanel(216, 254)));
   assert.ok(!svg.includes('Stars earned'));
@@ -460,13 +460,13 @@ test('すべて隠すと、右の列のない細いキャラクターだけの�
 });
 
 test('hide に all と書くと、すべての項目を隠す', () => {
-  assert.deepEqual(parseHide('all'), HIDEABLE);
-  assert.deepEqual(parseHide(' stars , all '), ['stars', ...HIDEABLE]);
+  assert.deepEqual(parseHide('all').hide, HIDEABLE);
+  assert.deepEqual(parseHide(' stars , all ').hide, ['stars', ...HIDEABLE]);
 });
 
 test('hide の項目の名前は、大文字で書いても受け付ける', () => {
-  assert.deepEqual(parseHide('Stars, PRS'), ['stars', 'prs']);
-  assert.deepEqual(parseHide('ALL'), HIDEABLE);
+  assert.deepEqual(parseHide('Stars, PRS').hide, ['stars', 'prs']);
+  assert.deepEqual(parseHide('ALL').hide, HIDEABLE);
 });
 
 test('細いカードの下枠は、文を折り返した行の数だけ高くなる', () => {
@@ -494,7 +494,7 @@ test('単語の切れ目で折り返し、ペットや姿の名前の途中で�
 });
 
 test('言語の枠が伸びても、行の間隔は言語の数で変わらない', () => {
-  const hide = ['stars', 'commits', 'prs', 'issues', 'repos'];
+  const hide = ['stars', 'contrib1yr', 'prs', 'issues', 'repos'];
   const rowsOf = (languages) => {
     const view = buildView({ ...account, repositories: [{ languages }] }, { ...options, hide });
     const svg = renderCard({ ...view, mode: 'light', motion: false }, placedFont);
@@ -515,10 +515,29 @@ test('言語は 5 つまで、それぞれ別の色と小数 2 桁の割合で�
   assert.doesNotMatch(svg, /d="Perl"|d="Other"/);
 });
 
-test('コミットは過去 1 年分だと分かる名前で出す', () => {
+test('過去 1 年の contributions の合計は、全期間の Total contributions と区別できる名前で、別の数として出す', () => {
   const svg = renderCard({ ...buildView(account, options), mode: 'light', motion: false }, plainFont);
-  assert.match(svg, /d="Commits \(1yr\)"/);
-  assert.doesNotMatch(svg, /Total commits/);
+  assert.match(svg, /d="Contrib \(1yr\)"/);
+  assert.match(svg, /d="1,874"/);
+  // Total contributions (全期間の 2,486) とは別の数で、過去 1 年の合計だけを変えても全期間の合計は変わらない。
+  assert.match(svg, /d="2,486"/);
+  const other = renderCard({ ...buildView({ ...account, yearContributions: 1875 }, options), mode: 'light', motion: false }, plainFont);
+  assert.match(other, /d="1,875"/);
+  assert.match(other, /d="2,486"/);
+  assert.doesNotMatch(other, /d="1,874"/);
+  assert.doesNotMatch(svg, /Commits/);
+});
+
+test('hide に前の名前 (commits) を書くと、Contrib (1yr) を隠して、名前が変わったと知らせる', () => {
+  const { hide, warnings } = parseHide('Commits, commits, stars');
+  assert.deepEqual(hide, ['contrib1yr', 'contrib1yr', 'stars']);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /hide の commits は contrib1yr に名前が変わりました/);
+  assert.match(warnings[0], /The hide item commits was renamed to contrib1yr/);
+  assert.deepEqual(parseHide('contrib1yr, all').warnings, []);
+  const svg = renderCard({ ...buildView(account, { ...options, hide }), mode: 'light', motion: false }, plainFont);
+  assert.doesNotMatch(svg, /Contrib \(1yr\)|1,874/);
+  assert.match(svg, /d="Total PRs"/);
 });
 
 test('下枠は連続記録と次の姿までの EXP を英語で伝える', () => {
@@ -617,7 +636,7 @@ test('ステータスは開始日の影響を受けず、成長だけが変わ�
   assert.equal(late.growth.exp, 3);
 });
 
-test('exp を渡したら、草から数え直さずにその EXP で育ち具合を決める', () => {
+test('exp を渡したら、コントリビューションのグラフから数え直さずにその EXP で育ち具合を決める', () => {
   const view = buildView(account, { ...options, exp: 500 });
   assert.equal(view.growth.exp, 500);
   assert.equal(view.growth.stage, 3);

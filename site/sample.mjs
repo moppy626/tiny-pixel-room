@@ -14,7 +14,7 @@ export function sampleAccount(now = new Date()) {
     today,
     days: [...run(addDays(today, -100), 61), ...run(today, 23)],
     totalContributions: 2486,
-    totalCommits: 1874,
+    yearContributions: 1874,
     stars: 342,
     totalPullRequests: 126,
     totalIssues: 58,

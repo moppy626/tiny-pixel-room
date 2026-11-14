@@ -7,18 +7,36 @@ import { bilingual } from './messages.mjs';
 import { cardRenderer } from './render.mjs';
 import { computeStreaks, expSince, isDate, summarizeLanguages } from './stats.mjs';
 
-export const HIDEABLE = ['contrib', 'current', 'longest', 'langs', 'stars', 'commits', 'prs', 'issues', 'repos'];
+export const HIDEABLE = ['contrib', 'current', 'longest', 'langs', 'stars', 'contrib1yr', 'prs', 'issues', 'repos'];
 // hide に all と書くと、すべての項目を隠す。あとで項目が増えても、キャラクターだけの細いカードのままになる。
 const HIDE_ALL = 'all';
+// 名前を変えた項目の、前の名前。Contrib (1yr) は、v1.0.1 までは Commits (1yr) (過去 1 年のコミットの数) で、名前は commits だった。
+// hide: commits と書いたワークフローが止まらないよう、同じ項目として受け付ける。
+// ただし、隠れるのは前とは別の数 (コミットの数ではなく contributions の合計) なので、黙って読み替えず、名前が変わったと知らせる。
+const RENAMED = { commits: 'contrib1yr' };
 export const MAX_NAME_LENGTH = 10;
 
 // 項目の名前は、大文字で書いても受け付ける。
-export const parseHide = (value) =>
-  value
-    .split(',')
-    .map((key) => key.trim().toLowerCase())
-    .filter(Boolean)
+const hideKeys = (value) => value.split(',').map((key) => key.trim().toLowerCase()).filter(Boolean);
+
+// hide の入力を読む。隠す項目 (hide) と、前の名前を読み替えたことを知らせる文 (warnings) を一緒に返すので、
+// 読み替えたのに知らせない、ということが起きない。
+// warnings は、前の名前ごとに 1 つずつ。「隠しています」と伝える文なので、GitHub から読めて、カードを作ると決まってから出す。
+export function parseHide(value) {
+  const keys = hideKeys(value);
+  const hide = keys
+    .map((key) => (Object.hasOwn(RENAMED, key) ? RENAMED[key] : key))
     .flatMap((key) => (key === HIDE_ALL ? HIDEABLE : [key]));
+  const olds = new Set(keys.filter((key) => Object.hasOwn(RENAMED, key)));
+  const warnings = Array.from(olds, (old) => {
+    const now = RENAMED[old];
+    return bilingual(
+      `hide の ${old} は ${now} に名前が変わりました。いまは ${now} として隠しています。${old} を ${now} に書き換えてください`,
+      `The hide item ${old} was renamed to ${now}. It is hidden as ${now} for now. Replace ${old} with ${now}`,
+    );
+  });
+  return { hide, warnings };
+}
 
 // Action と CLI で共通の入力チェック。問題があれば理由を返す。
 export function findInputError({ character, hide, language, since }) {
@@ -182,7 +200,7 @@ export function buildView(account, { character, since, exp, petName, hide = [], 
       currentStreak: current,
       longestStreak: longest,
       stars: account.stars,
-      commits: account.totalCommits,
+      yearContributions: account.yearContributions,
       pullRequests: account.totalPullRequests,
       issues: account.totalIssues,
       repositories: account.totalRepositories,

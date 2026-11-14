@@ -22,7 +22,7 @@ const git = (cwd, ...args) =>
   });
 
 function runAction(cwd, inputs = {}, env = {}, entry = ENTRY) {
-  const inputEnv = Object.entries({ 'github-token': 'dummy', username: 'octocat', ...inputs })
+  const inputEnv = Object.entries({ 'github-token': 'dummy', 'contributions-token': 'dummy', username: 'octocat', ...inputs })
     .map(([name, value]) => [`INPUT_${name.toUpperCase()}`, value]);
   return spawnSync(process.execPath, ['--import', FAKE_GITHUB, entry], {
     cwd,
@@ -89,10 +89,10 @@ test('Action が動かす dist/index.js でも、src と同じカードを作る
 
 // ワークフローに output-dir: '' のように空で書くと、Actions は既定値ではなく空の文字列を渡す。
 // そのとき src が使う値 (index.mjs の || のあと) が、action.yml の既定値と同じか確かめる。
-// github-token と username の既定は式なので比べない。commit は、git のない一時フォルダで動かすので false にする。
+// github-token、contributions-token、username の既定は式なので比べない (トークンは、空なら止まる)。commit は、git のない一時フォルダで動かすので false にする。
 test('空の入力は、action.yml の既定値と同じに扱う', (t) => {
   const inputs = actionInputs();
-  const names = Object.keys(inputs).filter((name) => !['github-token', 'username', 'commit'].includes(name));
+  const names = Object.keys(inputs).filter((name) => !['github-token', 'contributions-token', 'username', 'commit'].includes(name));
   const withDefaults = tempDir(t);
   const withEmpty = tempDir(t);
   assertSucceeded(runAction(withDefaults, { ...Object.fromEntries(names.map((name) => [name, inputs[name]])), commit: 'false' }));
@@ -182,6 +182,72 @@ for (const [inputs, message] of [
   });
 }
 
+// カードの数字は文字のパスになるので、数を変えたときにカードが変わるかで確かめる。配布する dist/index.js で動かす。
+test('GitHub から届いた過去 1 年の contributions の合計を、Contrib (1yr) としてカードに出す', (t) => {
+  const cardOf = (total, hide = '') => {
+    const dir = tempDir(t);
+    assertSucceeded(runAction(dir, { hide, commit: 'false' }, { FAKE_YEAR_TOTAL: String(total) }, DIST_ENTRY));
+    return readFileSync(join(dir, 'tiny-pixel-room/card-light-still.svg'), 'utf8');
+  };
+  // 偽の GitHub の全期間の合計 (2486) を超えると Total contributions も変わるので、それより小さい数で比べる。
+  assert.notEqual(cardOf(1234), cardOf(2345));
+  assert.equal(cardOf(1234, 'contrib1yr'), cardOf(2345, 'contrib1yr'));
+});
+
+test('hide に使えない項目があって止まるときは、前の名前 (commits) の警告を出さない', (t) => {
+  const result = runAction(tempDir(t), { hide: 'commits, nope' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /hide に使えない項目があります: nope/);
+  assert.doesNotMatch(result.stdout, /::warning::/);
+});
+
+test('hide に前の名前 (commits) を書くと、Contrib (1yr) を隠して、名前が変わったと警告する', (t) => {
+  const dir = tempDir(t);
+  const result = runAction(dir, { hide: 'commits', commit: 'false' });
+  assertSucceeded(result);
+  assert.match(result.stdout, /::warning::hide の commits は contrib1yr に名前が変わりました/);
+  const renamed = tempDir(t);
+  const quiet = runAction(renamed, { hide: 'contrib1yr', commit: 'false' });
+  assertSucceeded(quiet);
+  assert.doesNotMatch(quiet.stdout, /::warning::/);
+  const read = (from) => readFileSync(join(from, 'tiny-pixel-room/card-light-still.svg'), 'utf8');
+  assert.equal(read(dir), read(renamed));
+});
+
+// 偽の GitHub は、違うトークンで読まれたら 401 を返すので、Action が止まる (fake-github.mjs の wrongToken)。
+// dist/index.js でも確かめる。Action が実際に動かすのはこちらなので。
+for (const [label, entry] of [['src', ENTRY], ['dist/index.js', DIST_ENTRY]]) {
+  test(`コントリビューションの数は contributions-token で、リポジトリの数などは github-token で読む: ${label}`, (t) => {
+    const inputs = { 'github-token': 'personal', 'contributions-token': 'workflow', commit: 'false' };
+    const result = runAction(tempDir(t), inputs, { FAKE_API_TOKEN: 'personal', FAKE_CONTRIBUTIONS_TOKEN: 'workflow' }, entry);
+    assertSucceeded(result);
+  });
+}
+
+// github-token で代わりに読むと、気づかないままコントリビューションの数が少なくなることがあるので、止める。
+test('contributions-token が空なら、github-token で代わりに読まずに、直し方を示して止まる', (t) => {
+  const dir = tempDir(t);
+  const inputs = { 'github-token': 'personal', 'contributions-token': '', commit: 'false' };
+  const result = runAction(dir, inputs, { FAKE_API_TOKEN: 'personal', FAKE_CONTRIBUTIONS_TOKEN: 'personal' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /::error::contributions-token が空です。.*contributions-token の行を消して/);
+  assert.ok(!existsSync(join(dir, 'tiny-pixel-room/card-light.svg')));
+});
+
+test('contributions-token が使えなければ、github-token ではなく contributions-token を直すよう伝える', (t) => {
+  const inputs = { 'github-token': 'personal', 'contributions-token': 'expired', commit: 'false' };
+  const result = runAction(tempDir(t), inputs, { FAKE_API_TOKEN: 'personal', FAKE_CONTRIBUTIONS_TOKEN: 'workflow' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /::error::contributions-token のトークンが使えません \(401\)/);
+  assert.doesNotMatch(result.stderr, /github-token のトークンが使えません/);
+});
+
+test('偽の GitHub は、違うトークンで読まれたら Action を止める', (t) => {
+  const inputs = { 'github-token': 'personal', 'contributions-token': 'personal', commit: 'false' };
+  const result = runAction(tempDir(t), inputs, { FAKE_API_TOKEN: 'personal', FAKE_CONTRIBUTIONS_TOKEN: 'workflow' });
+  assert.notEqual(result.status, 0);
+});
+
 test('PR と Issue の権限がなくても、カードを作って警告する', (t) => {
   const dir = tempDir(t);
   const result = runAction(dir, { commit: 'false' }, { FAKE_GITHUB: 'forbidden' });
@@ -190,7 +256,8 @@ test('PR と Issue の権限がなくても、カードを作って警告する'
   assert.ok(existsSync(join(dir, 'tiny-pixel-room/card-light.svg')));
 });
 
-for (const hide of ['all', 'contrib,current,longest,langs,stars,commits,prs,issues,repos']) {
+// commits は Contrib (1yr) の前の名前 (Commits (1yr) だったころの名前) で、同じ項目として受け付ける。
+for (const hide of ['all', 'contrib,current,longest,langs,stars,contrib1yr,prs,issues,repos', 'contrib,current,longest,langs,stars,commits,prs,issues,repos']) {
   test(`hide にすべての項目を指定すると、キャラクターだけの細いカードを作る: ${hide}`, (t) => {
     const dir = tempDir(t);
     const result = runAction(dir, { hide, commit: 'false' });
@@ -221,8 +288,26 @@ test('トークンの期限が切れていたら、直し方を示して止ま�
   const dir = tempDir(t);
   const result = runAction(dir, { commit: 'false' }, { FAKE_GITHUB: 'unauthorized' });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /::error::github-token のトークンが使えません \(401\)/);
+  // 既定では 2 つの入力に同じトークンが渡るので、どちらの入力も直すよう伝える。
+  assert.match(result.stderr, /::error::github-token と contributions-token のトークンが使えません \(401\)/);
   assert.ok(!existsSync(join(dir, 'tiny-pixel-room/card-light.svg')));
+});
+
+// 「隠しています」と伝える警告なので、カードを作らずに止まるときは出さない。
+test('GitHub から読めずに止まるときは、hide の前の名前 (commits) の警告を出さない', (t) => {
+  const result = runAction(tempDir(t), { hide: 'commits', commit: 'false' }, { FAKE_GITHUB: 'unauthorized' });
+  assert.equal(result.status, 1);
+  assert.doesNotMatch(result.stdout, /::warning::/);
+});
+
+test('state.json が壊れていて止まるときは、hide の前の名前 (commits) の警告を出さない', (t) => {
+  const dir = tempDir(t);
+  mkdirSync(join(dir, 'tiny-pixel-room'), { recursive: true });
+  writeFileSync(join(dir, 'tiny-pixel-room/state.json'), '{');
+  const result = runAction(dir, { hide: 'commits', commit: 'false' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /state\.json が壊れています/);
+  assert.doesNotMatch(result.stdout, /::warning::/);
 });
 
 test('language を変えるとカードは変わるが、開始日はリセットされない', (t) => {
@@ -421,10 +506,12 @@ test('既定のブランチ以外で動いたら、カードを更新しない',
   git(work, 'push', '--quiet', '-u', 'origin', 'patch-1');
   const head = git(remote, 'rev-parse', 'patch-1');
 
-  const result = runAction(work, {}, { GITHUB_REF_NAME: 'patch-1', GITHUB_EVENT_PATH: event });
+  // hide に前の名前を書いていても、隠してもいないので、名前が変わったという警告は出さない。
+  const result = runAction(work, { hide: 'commits' }, { GITHUB_REF_NAME: 'patch-1', GITHUB_EVENT_PATH: event });
 
   assertSucceeded(result);
   assert.match(result.stdout, /::notice::既定のブランチ \(main\) ではないので/);
+  assert.doesNotMatch(result.stdout, /::warning::/);
   assert.equal(git(remote, 'rev-parse', 'patch-1'), head);
   assert.ok(!existsSync(join(work, 'tiny-pixel-room')));
 });
@@ -460,18 +547,18 @@ test('state.json がなければ、今日から育てはじめることと outpu
   assert.match(result.stdout, /::notice::tiny-pixel-room\/state\.json がないので、今日から育てはじめます。output-dir を変えたときは/);
 });
 
-test('キャラクターを変えたら、草の日付での今日の次の日から数える', (t) => {
+test('キャラクターを変えたら、コントリビューションのグラフの日付での今日の次の日から数える', (t) => {
   const dir = tempDir(t);
   mkdirSync(join(dir, 'tiny-pixel-room'));
   writeFileSync(join(dir, 'tiny-pixel-room/state.json'), JSON.stringify({ version: 1, character: 'turnip', since: '2026-05-01', maxExp: 0 }));
   assertSucceeded(runAction(dir, { character: 'cactus', commit: 'false' }));
-  // 偽の GitHub は、既定のトークンと同じく UTC の今日で終わる草を返す。
+  // 偽の GitHub は、既定のトークンと同じく UTC の今日で終わるコントリビューションのグラフを返す。
   const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const state = JSON.parse(readFileSync(join(dir, 'tiny-pixel-room/state.json'), 'utf8'));
   assert.deepEqual(state, { version: 1, character: 'cactus', since: tomorrow, maxExp: 0 });
 });
 
-// 偽の GitHub の草は 9 日間、毎日 3 件なので、開始日が古ければ 27 EXP になる。
+// 偽の GitHub のコントリビューションのグラフは 9 日間、毎日 3 件なので、開始日が古ければ 27 EXP になる。
 const FAKE_EXP = 27;
 
 function runWithState(t, state) {
@@ -483,7 +570,7 @@ function runWithState(t, state) {
   return { saved: JSON.parse(read('state.json')), title: read('card-light.svg').match(/<title[^>]*>([^<]*)</)[1] };
 }
 
-test('草の数が減っても、最高 EXP より下げず、育った姿を保つ', (t) => {
+test('contributions の数が減っても、最高 EXP より下げず、育った姿を保つ', (t) => {
   const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 500 };
   const { saved, title } = runWithState(t, state);
   assert.deepEqual(saved, state);
@@ -499,32 +586,8 @@ test('EXP が最高 EXP を超えたら、state.json の最高 EXP を更新す�
   assert.match(title, /たね Lv\.2/);
 });
 
-// 1 つのリポジトリが読めつづけないだけで、カード全体がずっと更新されなくならないようにする。
-// キャラクターを変えても、育ちには関係しないので引き継ぐ。
-for (const character of ['turnip', 'cactus']) {
-  test(`非公開リポジトリのコミットを数えきれなかった日も、カードは更新し、前の実行で数えた数を state.json に残す: character ${character}`, (t) => {
-    const dir = tempDir(t);
-    mkdirSync(join(dir, 'tiny-pixel-room'));
-    const privateCommits = { count: 5, reading: 'authored', userId: 'U_fake' };
-    const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: FAKE_EXP, privateCommits };
-    writeFileSync(join(dir, 'tiny-pixel-room/state.json'), JSON.stringify(state));
-    // 偽の GitHub の今日 (UTC の今日) が、数えきれなくなった日になる。動かしているあいだに日付が変わってもよいよう、前後の日を取る。
-    const utcToday = () => new Date().toISOString().slice(0, 10);
-    const before = utcToday();
-    const result = runAction(dir, { character, commit: 'false' }, { FAKE_GITHUB: 'private-error' });
-    const after = utcToday();
-    assertSucceeded(result);
-    assert.match(result.stdout, /::warning::非公開リポジトリのコミットを数えきれなかったので、前に数えた数を使います/);
-    const saved = JSON.parse(readFileSync(join(dir, 'tiny-pixel-room/state.json'), 'utf8'));
-    assert.equal(saved.character, character);
-    const { failedSince, ...kept } = saved.privateCommits;
-    assert.deepEqual(kept, privateCommits);
-    assert.ok([before, after].includes(failedSince));
-  });
-}
-
-test('非公開リポジトリのコミットを数えないなら、state.json に残した数を消す', (t) => {
-  const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: FAKE_EXP };
-  const { saved } = runWithState(t, { ...state, privateCommits: { count: 5, reading: 'all', userId: 'U_fake' } });
+test('v1.0.1 が state.json に残した非公開リポジトリのコミットの数は、育ちを保ったまま消す', (t) => {
+  const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 500 };
+  const { saved } = runWithState(t, { ...state, privateCommits: { count: 211, reading: 'all', userId: 'U_fake' } });
   assert.deepEqual(saved, state);
 });

@@ -6,7 +6,7 @@ import { buildCards, findInputError, parseHide, writeCards } from './card.mjs';
 import { fetchAccount } from './github.mjs';
 import { DEFAULT_LANGUAGE } from './growth.mjs';
 import { NAME, bilingual, encodeCommand } from './messages.mjs';
-import { nextState, readState, recordExp, recordPrivateCommits, writeState } from './state.mjs';
+import { nextState, readState, recordExp, writeState } from './state.mjs';
 import { expSince } from './stats.mjs';
 
 const PUSH_ATTEMPTS = 3;
@@ -86,16 +86,26 @@ function pushCards() {
 
 async function main() {
   const token = input('github-token');
+  // コントリビューションの数を読むトークン (github.mjs の fetchAccount)。
+  // 空のとき (シークレットの名前の書き間違いなど) に github-token で読むと、自分で作ったトークンを渡している場合に、
+  // 気づかないまま数が少なくなることがある。github-token と同じく、空なら止める。
+  const contributionsToken = input('contributions-token');
   const login = input('username');
   // character、hide (parseHide)、language は、大文字で書いても受け付ける。
   const character = input('character').toLowerCase() || 'turnip';
   const outputDir = input('output-dir') || 'tiny-pixel-room';
-  const hide = parseHide(input('hide'));
+  const { hide, warnings: hideWarnings } = parseHide(input('hide'));
   const language = input('language').toLowerCase() || DEFAULT_LANGUAGE;
   const motion = flag('motion');
   const commit = flag('commit');
 
   if (!token) fail(bilingual('github-token が空です', 'github-token is empty'));
+  if (!contributionsToken) {
+    fail(bilingual(
+      'contributions-token が空です。ワークフローの contributions-token の行を消して、既定のトークンに戻してください',
+      'contributions-token is empty. Remove the contributions-token line from the workflow to go back to the default token',
+    ));
+  }
   if (!login) fail(bilingual('username が空です', 'username is empty'));
   const inputError = findInputError({ character, hide, language });
   if (inputError) fail(inputError);
@@ -123,9 +133,12 @@ async function main() {
     ));
   }
 
-  const account = await fetchAccount(login, token, { privateCommits: previous?.privateCommits, warn });
+  const account = await fetchAccount(login, token, { contributionsToken });
+  // hide の前の名前を読み替えたことは、カードを作ると決まってから知らせる。「隠しています」と伝える文なので、
+  // 既定のブランチではなく更新しないときや、state.json が壊れているか GitHub から読めずに止まるときは、隠してもいないので出さない。
+  hideWarnings.forEach(warn);
   const started = nextState(previous, character, account.today);
-  const state = recordPrivateCommits(recordExp(started, expSince(account.days, started.since)), account.privateCommits);
+  const state = recordExp(started, expSince(account.days, started.since));
   const cards = buildCards(account, { character, exp: state.maxExp, petName: input('pet-name'), hide, motion, language, warn });
 
   await writeCards(outputDir, cards);

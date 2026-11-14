@@ -13,10 +13,10 @@ const run = (end, length) => Array.from({ length }, (_, i) => ({ date: addDays(e
 const account = {
   login: 'your-name',
   today: TODAY,
-  // Longest streak が 61 日、Current streak が 23 日になる草。
+  // Longest streak が 61 日、Current streak が 23 日になるカレンダー。
   days: [...run('2026-07-31', 61), ...run(TODAY, 23)],
   totalContributions: 2486,
-  totalCommits: 1874,
+  yearContributions: 1874,
   stars: 342,
   totalPullRequests: 126,
   totalIssues: 58,
@@ -46,7 +46,7 @@ const SAMPLES = [
   { options: { character: 'sunflower', exp: 640, petName: 'Himari', language: 'en' }, files: stills('sunflower-en') },
   { options: { character: 'cactus', exp: 120, hide: ['langs'] }, files: stills('cactus-hide-langs') },
   // README の説明と同じく、hide: all で作る。
-  { options: { character: 'turnip', exp: 1240, hide: parseHide('all') }, files: stills('character-only') },
+  { options: { character: 'turnip', exp: 1240, hide: parseHide('all').hide }, files: stills('character-only') },
 ];
 
 for (const { options, files } of SAMPLES) await writeCards(OUT, files(buildCards(account, options)));

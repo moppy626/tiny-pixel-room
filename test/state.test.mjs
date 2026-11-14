@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { nextState, readState, recordExp, recordPrivateCommits } from '../src/state.mjs';
+import { nextState, readState, recordExp, writeState } from '../src/state.mjs';
 
 function stateFile(t, text) {
   const dir = mkdtempSync(join(tmpdir(), 'tiny-pixel-room-'));
@@ -56,6 +56,20 @@ test('キャラクターが同じなら、開始日は変えない', () => {
   assert.equal(nextState(state, 'turnip', '2026-11-08'), state);
 });
 
+// 読むところではなく書くところで落とすので、state がどこから来ても state.json には戻らない。
+test('v1.0.1 が残した非公開リポジトリのコミットの数は、書き出すときに落とし、ほかの項目は残す', async (t) => {
+  const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 0, memo: 'kept' };
+  const privateCommits = { count: 211, reading: 'all', userId: 'U_octocat' };
+  const path = stateFile(t, JSON.stringify({ ...state, privateCommits }));
+  await writeState(path, { ...state, privateCommits });
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), state);
+});
+
+test('version のない state.json に、読むときに version を足さない', async (t) => {
+  const state = { character: 'turnip', since: '2026-05-01', maxExp: 0, memo: 'kept' };
+  assert.deepEqual(await readState(stateFile(t, JSON.stringify(state))), state);
+});
+
 test('キャラクターを変えたら、次の日から数える', () => {
   const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 0 };
   assert.equal(nextState(state, 'cactus', '2026-11-08').since, '2026-11-09');
@@ -76,24 +90,11 @@ test('EXP が最高 EXP を超えたら、最高 EXP を更新する', () => {
   assert.deepEqual(recordExp(state, 130), { ...state, maxExp: 130 });
 });
 
-test('草の数が減って EXP が下がっても、最高 EXP は下げない', () => {
+test('contributions の数が減って EXP が下がっても、最高 EXP は下げない', () => {
   const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 600 };
   assert.equal(recordExp(state, 420).maxExp, 600);
 });
 
 test('初めて使う日の EXP も、最高 EXP として覚える', () => {
   assert.equal(recordExp(nextState(null, 'turnip', '2026-11-08'), 42).maxExp, 42);
-});
-
-test('非公開リポジトリのコミットの数と読み方と数えた人と数えきれなくなった日を残し、なければ消す', () => {
-  const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 0 };
-  const privateCommits = { count: 5, reading: 'authored', userId: 'U_octocat', failedSince: '2026-05-08' };
-  assert.deepEqual(recordPrivateCommits(state, privateCommits), { ...state, privateCommits });
-  assert.deepEqual(recordPrivateCommits({ ...state, privateCommits }, undefined), state);
-});
-
-// 形の違う privateCommits は fetchAccount がないものとして扱い、次に残すときに直す。育ちには関係しないので止めない。
-test('privateCommits の形が違っても、state.json は読む', async (t) => {
-  const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 0, privateCommits: 'broken' };
-  assert.deepEqual(await readState(stateFile(t, JSON.stringify(state))), state);
 });

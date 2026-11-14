@@ -1,4 +1,6 @@
 // 手元で試すための入口。例: GITHUB_TOKEN=... node src/cli.mjs --user octocat --out out
+// Action は、コントリビューションの数を別のトークン (contributions-token) で読む (github.mjs の fetchAccount)。
+// 同じ読み方を試すときは、そのトークンを環境変数 CONTRIBUTIONS_TOKEN に入れる。なければ、すべて GITHUB_TOKEN で読む。
 import { parseArgs } from 'node:util';
 import { buildCards, findInputError, parseHide, writeCards } from './card.mjs';
 import { fetchAccount } from './github.mjs';
@@ -30,20 +32,32 @@ try {
   exitWith(bilingual(`オプションの指定が正しくありません: ${error.message}`, `Invalid options: ${error.message}`));
 }
 
+// Action の入力と同じく、トークンの前後の空白や改行 ($(cat file) の末尾など) は外す。
+// 残すと、空白だけの違いで別のトークンとして扱ったり、ヘッダーに改行が入って通信できなかったりする。
+const env = (name) => (process.env[name] ?? '').trim();
+const token = env('GITHUB_TOKEN');
+const contributionsToken = env('CONTRIBUTIONS_TOKEN');
+
 // 入力の誤り (findInputError) と同じく、日本語の行のあとに英語の行を続ける。
-if (!values.user || !process.env.GITHUB_TOKEN) {
+if (!values.user || !token) {
   exitWith(bilingual('--user と環境変数 GITHUB_TOKEN が必要です', '--user and the GITHUB_TOKEN environment variable are required'));
 }
 // Action と同じく、character、hide (parseHide)、language は大文字で書いても受け付ける。
 const character = values.character.toLowerCase();
-const hide = parseHide(values.hide);
+const { hide, warnings: hideWarnings } = parseHide(values.hide);
 const language = values.language.toLowerCase();
 const inputError = findInputError({ character, hide, language, since: values.since });
 if (inputError) exitWith(inputError);
 
 // GitHub API のエラー (github.mjs) は、日本語と英語の 2 行の文になっている。
 try {
-  const account = await fetchAccount(values.user, process.env.GITHUB_TOKEN);
+  // CONTRIBUTIONS_TOKEN が GITHUB_TOKEN と同じなら、渡さないのと同じ読み方になる。
+  // 渡すと、401 のときに Action の 2 つの入力 (github-token と contributions-token) を直すよう伝えてしまうので、渡さない。
+  const account = await fetchAccount(values.user, token, {
+    contributionsToken: contributionsToken && contributionsToken !== token ? contributionsToken : undefined,
+  });
+  // 「隠しています」と伝える文なので、GitHub から読めて、カードを作ると決まってから出す。
+  hideWarnings.forEach((message) => console.warn(message));
   const cards = buildCards(account, {
     character,
     since: values.since ?? account.today,

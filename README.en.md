@@ -15,7 +15,7 @@ This README is a summary. For details such as how each number is counted, see th
 
 - Choose a turnip, a sunflower, or a cactus. Each one grows through 5 stages.
 - The card text and the character's name can be in Japanese (the default) or English. The workflow below sets `language: en` for an English card.
-- The card shows your total contributions, streaks, most used languages, stars, commits in the past year, PRs, issues, and repositories.
+- The card shows your contributions (all-time and in the past year), streaks, most used languages, stars, PRs, issues, and repositories.
 - The room switches between day and night to match each viewer's GitHub or browser setting. You can also always show the day or night room.
 - Viewers who prefer reduced motion see a still card.
 
@@ -96,6 +96,7 @@ All inputs under `with:` are optional.
 | `motion` | `true` | `false` stops the character's animation |
 | `username` | Repository owner | The GitHub username shown on the card |
 | `github-token` | `github.token` | The token used to read the GitHub API. Keep the default. Passing your own token isn't supported ([Tokens](#good-to-know)) |
+| `contributions-token` | `github.token` | The token used to read contribution counts (Total contributions, Contrib (1yr), streaks, and EXP). Keep the default. Passing your own token isn't supported ([Tokens](#good-to-know)) |
 | `output-dir` | `tiny-pixel-room` | The folder for the cards and the state file (`state.json`). If you change it, move `state.json` from the old folder too, or the growth starts over |
 | `commit` | `true` | `false` skips the commit. Then save `state.json` yourself, or the growth starts over on every run |
 
@@ -108,14 +109,14 @@ All inputs under `with:` are optional.
 | Longest streak | `longest` | Your longest run of days in a row with contributions |
 | Most used languages | `langs` | Your top 5 languages across your repositories, with their shares |
 | Stars earned | `stars` | Total stars on your repositories |
-| Commits (1yr) | `commits` | Commits in the past year |
+| Contrib (1yr) | `contrib1yr` | Total contributions in the past year, as shown in your profile's contribution graph (the two can differ slightly) |
 | Total PRs | `prs` | Pull requests you've opened |
 | Total issues | `issues` | Issues you've opened |
 | Repositories | `repos` | Number of your repositories |
 
 ## Private activity
 
-Stars, commits, PRs, issues, repositories, and languages count public repositories only.
+Stars, PRs, issues, repositories, and languages count public repositories only.
 
 ## Growth
 
@@ -131,7 +132,7 @@ Days are counted in UTC, the same as the contribution graph that the Action read
 
 - **When GitHub has trouble:** Temporary errors (such as 5xx errors, timeouts, and API rate limits) are retried up to twice. If it still fails, the card isn't updated that day, and the next day's run updates it.
 - **Characters in the name:** The name can use Japanese, English, Hangul, Chinese, accented Latin letters, Greek, Cyrillic, Armenian, Georgian, and common symbols. Other characters (such as Arabic, Hebrew, Thai, and Indic scripts) and emoji such as 🌱 and ✨ are removed from the name, with a warning in the Action's run results.
-- **Tokens:** Keep `github-token` at its default. Passing your own token isn't supported. The Action's code can use any token you pass to it as is, so if the token ever leaked, everything that token can access could be read.
+- **Tokens:** Keep `github-token` and `contributions-token` at their defaults. Passing your own token isn't supported. The Action's code can use any token you pass to it as is, so if the token ever leaked, everything that token can access could be read.
 - **Other branches:** When the workflow runs on a branch other than the default branch, the card isn't updated.
 - **When updates stop:** GitHub may stop scheduled runs in a repository with no activity for 60 days. Turn the workflow back on from the repository's Actions tab.
 - **Pinning a version:** `@v1` is a tag that moves to each new release. To check new releases before using them, write a commit SHA instead of `@v1` (such as `moppy626/tiny-pixel-room@<commit SHA> # v1.0.0`). With Dependabot (`package-ecosystem: github-actions`) in your profile repository, you get a PR when a new version is released.

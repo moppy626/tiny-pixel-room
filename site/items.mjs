@@ -5,7 +5,7 @@ export const ITEMS = {
   contrib: {
     label: 'Total contributions',
     description: {
-      ja: 'プロフィールの草に出る contributions の、これまでの合計',
+      ja: 'プロフィールのコントリビューションのグラフに出る contributions の、これまでの合計',
       en: "All-time total of the contributions shown in your profile's contribution graph",
     },
   },
@@ -25,9 +25,12 @@ export const ITEMS = {
     label: 'Stars earned',
     description: { ja: '自分のリポジトリについたスターの合計', en: 'Total stars on your repositories' },
   },
-  commits: {
-    label: 'Commits (1yr)',
-    description: { ja: '過去 1 年のコミットの数', en: 'Commits in the past year' },
+  contrib1yr: {
+    label: 'Contrib (1yr)',
+    description: {
+      ja: 'プロフィールのコントリビューションのグラフに出る、過去 1 年の contributions の合計 (少し違うことがあります)',
+      en: "Total contributions in the past year, as shown in your profile's contribution graph (the two can differ slightly)",
+    },
   },
   prs: {
     label: 'Total PRs',
