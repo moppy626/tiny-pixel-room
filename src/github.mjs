@@ -1,7 +1,7 @@
 // GitHub GraphQL API からアカウント全体のデータを取る。
 import { setTimeout as delay } from 'node:timers/promises';
 import { bilingual } from './messages.mjs';
-import { addDays } from './stats.mjs';
+import { addDays, isDate } from './stats.mjs';
 
 const ENDPOINT = 'https://api.github.com/graphql';
 const YEARS_PER_REQUEST = 5;
@@ -12,8 +12,8 @@ const TIMEOUT_MS = 30000;
 // これより長く待つ必要があるときはやり直さず、その日の更新はあきらめる。
 export const RATE_LIMIT_WAIT_MS = 60000;
 
-// テストで待ち時間を飛ばせるよう、待つ処理をオブジェクトに入れておく。
-export const retryTimer = { wait: (ms) => delay(ms) };
+// テストで待ち時間を飛ばせるよう、待つ処理をオブジェクトに入れておく。signal が中止されたら、待つのをやめる。
+export const retryTimer = { wait: (ms, signal) => delay(ms, undefined, { signal }) };
 
 // 既定のトークンでは起きない。自分で作ったトークン (サポート外) を渡したときに、期限切れなどで起きる。
 const UNAUTHORIZED_MESSAGE = bilingual(
@@ -33,8 +33,13 @@ const headers = (token) => ({
   'user-agent': 'tiny-pixel-room',
 });
 
+// GitHub から思うように読めなかったときの失敗。コードのバグ (TypeError など) と分けるのに使う。
+class FetchFailure extends Error {}
+
 // やり直してよい失敗には、最低限待つ時間 (retryAfterMs) を付ける。
-const failure = (message, fields = {}) => Object.assign(new Error(message), fields);
+// 重いクエリで GitHub が返しきれなかったかもしれない失敗 (タイムアウトと 5xx) には、tooHeavy も付ける。
+// 軽い読み方なら数えられるかを決めるのに使う (fetchPrivateCommits)。
+const failure = (message, fields = {}) => Object.assign(new FetchFailure(message), fields);
 
 const UNREADABLE_RESPONSE = bilingual('GitHub API の応答を読めませんでした', "Couldn't read the GitHub API response");
 
@@ -53,35 +58,44 @@ const userNotFound = (login) =>
     `GitHub user ${login} was not found. Set username to a GitHub username (organization names can't be used)`,
   );
 
-async function withRetry(attempt) {
+// signal が中止されたら、やり直さずに、待っているところでもやめる。
+// retryTooHeavy が false なら、重すぎたかもしれない失敗 (tooHeavy) は、同じ問い合わせではやり直さない。
+// 呼ぶ側が、軽くした問い合わせで読み直すとき (readRepository)。同じ重さでは、やり直しても待つ時間がかかるだけになりやすいため。
+async function withRetry(attempt, signal, { retryTooHeavy = true } = {}) {
   for (let i = 0; ; i += 1) {
+    signal?.throwIfAborted();
     try {
       return await attempt();
     } catch (error) {
-      if (error.retryAfterMs === undefined || i === RETRY_DELAYS_MS.length) throw error;
-      await retryTimer.wait(Math.max(error.retryAfterMs, RETRY_DELAYS_MS[i]));
+      const retryable = error.retryAfterMs !== undefined && (retryTooHeavy || !error.tooHeavy);
+      if (signal?.aborted || !retryable || i === RETRY_DELAYS_MS.length) throw error;
+      await retryTimer.wait(Math.max(error.retryAfterMs, RETRY_DELAYS_MS[i]), signal);
     }
   }
 }
 
-// 1 回分の通信。本文を読み終えるまでをタイムアウトに含める。
-async function send(url, init) {
+// 1 回分の通信。本文を読み終えるまでをタイムアウトに含める。signal が中止されたら、応答を待たずにやめる。
+async function send(url, init, signal) {
   let response;
   let text;
   try {
-    response = await fetch(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const timeout = AbortSignal.timeout(TIMEOUT_MS);
+    response = await fetch(url, { ...init, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
     text = await response.text();
   } catch (error) {
+    // 呼ぶ側が中止したときは、やり直す失敗にしない。
+    if (signal?.aborted) throw signal.reason;
     const seconds = TIMEOUT_MS / 1000;
     const reason = error.cause?.message ?? error.message;
-    const message = error.name === 'TimeoutError'
+    const tooHeavy = error.name === 'TimeoutError';
+    const message = tooHeavy
       ? bilingual(`GitHub API から ${seconds} 秒以内に応答がありませんでした`, `The GitHub API didn't respond within ${seconds} seconds`)
       : bilingual(`GitHub API に接続できませんでした: ${reason}`, `Couldn't connect to the GitHub API: ${reason}`);
-    throw failure(message, { retryAfterMs: 0 });
+    throw failure(message, { retryAfterMs: 0, tooHeavy });
   }
   const { status, ok } = response;
   if (status === 401) throw failure(UNAUTHORIZED_MESSAGE, { status });
-  if (status >= 500) throw httpError(status, null, { retryAfterMs: 0 });
+  if (status >= 500) throw httpError(status, null, { retryAfterMs: 0, tooHeavy: true });
   let body = null;
   try {
     body = JSON.parse(text);
@@ -116,12 +130,13 @@ const isForbidden = (error) => error.type === 'FORBIDDEN' || /not accessible/i.t
 const isUnreadable = (error) => isForbidden(error) || error.type === 'NOT_FOUND' || error.type === 'INSUFFICIENT_SCOPES';
 
 // 1 回分の通信を、一時的な失敗や回数の上限ならやり直して送る。回数の上限でない応答は read に渡し、その戻り値を返す。
-function call(url, init, read) {
+// options は withRetry に渡す。
+function call(url, init, read, signal, options) {
   return withRetry(async () => {
-    const response = await send(url, init);
+    const response = await send(url, init, signal);
     if (isRateLimited(response)) throw rateLimitFailure(response.status, response.headers, { status: response.status });
     return read(response);
-  });
+  }, signal, options);
 }
 
 // 1 回分の問い合わせ。{ data, unreadable } を返す。
@@ -130,7 +145,7 @@ function call(url, init, read) {
 // 呼ぶ側は unreadable で、null が読めないからなのか、ほんとうにないからなのかを分ける。
 // 読めない項目のエラーの文には、読めなかった非公開リポジトリの名前が入ることがある。
 // 公開リポジトリの実行結果にも出ないよう、ほかのエラーで止まるときも、その文は出さない。
-function request(token, query, variables, partial) {
+function request(token, query, variables, partial, signal, options) {
   const init = {
     method: 'POST',
     headers: { ...headers(token), 'content-type': 'application/json' },
@@ -154,22 +169,31 @@ function request(token, query, variables, partial) {
       forbidden: errors.every(isForbidden),
       notFound: errors.every((e) => e.type === 'NOT_FOUND'),
       retryAfterMs: timedOut ? 0 : undefined,
+      tooHeavy: timedOut,
     });
-  });
+  }, signal, options);
 }
 
 const graphql = async (token, query, variables) => (await request(token, query, variables, false)).data;
 // 読めない項目があっても止めずに、{ data, unreadable } を返す。非公開リポジトリを読むときに使う。
-const graphqlPartial = (token, query, variables) => request(token, query, variables, true);
+// signal が中止されたら、応答もやり直しも待たずにやめる。options は withRetry に渡す。
+const graphqlPartial = (token, query, variables, signal, options) => request(token, query, variables, true, signal, options);
 
 // REST API の GET。見つからないか読めない (回数の上限ではない 403) ときは null を返す。
-function restGet(token, path) {
+// タイムアウトや 5xx でも tooHeavy にしない。REST の問い合わせは、非公開リポジトリの読み方で重さが変わらず、
+// 軽い読み方で数え直しても同じ問い合わせを送るので、数え直しても数えられるとは限らず、数が下がるだけになりうるため。
+async function restGet(token, path, signal) {
   const init = { headers: { ...headers(token), accept: 'application/vnd.github+json' } };
-  return call(`https://api.github.com${path}`, init, ({ status, ok, body }) => {
-    if (status === 403 || status === 404) return null;
-    if (!ok) throw httpError(status, body);
-    return body;
-  });
+  try {
+    return await call(`https://api.github.com${path}`, init, ({ status, ok, body }) => {
+      if (status === 403 || status === 404) return null;
+      if (!ok) throw httpError(status, body);
+      return body;
+    }, signal);
+  } catch (error) {
+    if (error instanceof FetchFailure) error.tooHeavy = false;
+    throw error;
+  }
 }
 
 // 範囲を指定しない contributionsCollection の草は、草と同じ地域の今日で終わる。
@@ -274,12 +298,13 @@ const PRIVATE_REPOSITORIES_QUERY = `query ($login: String!, $after: String, $sin
 // $all なら、Co-authored-by に名前があるだけのコミットも数えるので、だれのコミットも読む ($author は null)。
 // そうでなければ、$author のユーザーが author のコミットだけを読む (ユーザーのメールアドレスで、GitHub が絞る)。
 // committer と authors は、だれのコミットも読むときにしか使わないので、そのときだけ取る。
-const HISTORY_QUERY = `query ($owner: String!, $name: String!, $ref: String!, $since: GitTimestamp!, $all: Boolean!, $author: CommitAuthor, $after: String) {
+// $first は 1 ページのコミットの数 (HISTORY_PAGE_SIZES)。
+const HISTORY_QUERY = `query ($owner: String!, $name: String!, $ref: String!, $since: GitTimestamp!, $all: Boolean!, $author: CommitAuthor, $first: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     ref(qualifiedName: $ref) {
       target {
         ... on Commit {
-          history(first: 100, after: $after, since: $since, author: $author) {
+          history(first: $first, after: $after, since: $since, author: $author) {
             pageInfo { hasNextPage endCursor }
             nodes {
               oid
@@ -380,16 +405,31 @@ async function fetchLanguages(login, token) {
 
 // 非公開リポジトリのコミットを数えるときに、同時に読むリポジトリの数。
 const REPOSITORY_CONCURRENCY = 4;
-// 非公開リポジトリのコミットを数えるのに送る問い合わせ (一覧と履歴のページ) の数の、見積もりの上限。
+// 非公開リポジトリのコミットを数えるのに送る問い合わせ (一覧と履歴のページと、Pages のサイトを確かめる REST の問い合わせ) の数の、見積もりの上限。
 // だれのコミットも読むと、読む量はリポジトリの大きさで決まる。大きな組織のリポジトリが読めるトークンでも、
 // 回数の上限やタイムアウトで毎回数えきれないことがないよう、見積もりがこれを超えるなら、本人が author のコミットだけを読む。
 // それでも超えるなら、非公開リポジトリは読まない。
+// だれのコミットも読んでは重すぎて数えきれず、本人が author のコミットだけを読んで数え直す日は、そのぶんも送る (fetchPrivateCommits)。
+// 数え直したあとの LIGHTER_READING_DAYS 日は、だれのコミットも読まないので、毎回にはならない。
+// 重すぎた履歴のページを小さくして読み直したブランチも、見積もりより多く送る (HISTORY_PAGE_SIZES)。
 export const MAX_PRIVATE_REQUESTS = 200;
+// だれのコミットも読むときの、履歴の 1 ページのコミットの数。ふつうは最初の数で読む。
+// 重すぎて GitHub が返しきれなければ (tooHeavy)、同じページを次の数で読み直し、そのブランチの残りのページも、その数で読む。
+// 1 ページで本人と照らし合わせるコミットと Co-authored-by の人が減るので、GitHub の数え方のまま、軽く読めることがある。
+// 軽い読み方 (本人が author のコミットだけを読む) で数え直すと、カードの数が GitHub の数え方の数より下がるので、その前にためす。
+// いちばん小さい数でも重すぎれば、その数でやり直してから失敗する (そのあと fetchPrivateCommits で、軽い読み方で数え直す)。
+// 本人が author のコミットだけを読むときは、本人のコミットがまばらなら、ページを小さくしても GitHub が読み進める量は減らないので、小さくしない。
+export const HISTORY_PAGE_SIZES = [100, 50, 25];
 // 非公開リポジトリの読み方。重い順に、だれのコミットも読む (all)、本人が author のコミットだけを読む (authored)、読まない (none)。
 // 見積もりにはほかの人のコミットも入るので、上限の近くでは、ほかの人の活動で読み方が実行ごとに変わり、数も増えたり減ったりしうる。
 // そうならないよう、前の実行の読み方を state.json に残しておき、前より重い読み方には、見積もりが上限の 8 割まで下がったときだけ戻す。
 const READINGS = ['all', 'authored', 'none'];
 export const HEAVIER_READING_REQUESTS = MAX_PRIVATE_REQUESTS * 0.8;
+// だれのコミットも読んでは重すぎて数えきれず、本人が author のコミットだけを読んで数え直した日 (lighterSince) から、
+// LIGHTER_READING_DAYS 日のあいだは、見積もりが上限より少なくても、だれのコミットも読まない。
+// 毎回重すぎるリポジトリがあると、だれのコミットも読んでは毎日失敗し、そのたびに数え直して、問い合わせも時間も 2 倍かかるため。
+// 日数がたったら、またためす。重すぎなくなっていれば、だれのコミットも読んで数える。
+export const LIGHTER_READING_DAYS = 7;
 const readingLimit = (reading, previous) =>
   READINGS.indexOf(reading) < READINGS.indexOf(previous) ? HEAVIER_READING_REQUESTS : MAX_PRIVATE_REQUESTS;
 
@@ -406,48 +446,84 @@ function branchesOf(repository) {
   return branches.filter((branch) => branch.commits !== 0);
 }
 
-// 一覧の 1 つのリポジトリと、読むブランチと、ブランチを読む問い合わせの数の、読み方ごとの見積もり (requests)。
+// 一覧の 1 つのリポジトリと、読むブランチと、そのリポジトリを読む問い合わせの数の、読み方ごとの見積もり (requests)。
 // all は、だれのコミットも読むとき (コミット 100 件で 1 回)。authored は、本人が author のコミットだけを読むとき (ブランチごとに 1 回)。
+// all は、重すぎてページを小さくして読み直すブランチがあれば、そのぶん多く読む (HISTORY_PAGE_SIZES)。
+// 重すぎるかは読む前には分からないので、見積もりは最初のページの大きさで決め、実行ごとに揺れないようにする。
 // 本人のコミットが 100 件を超えるブランチはそのぶん多く読むが、本人のコミットは非公開の活動の数より少ないので、大きくは増えない。
 // コミットの数が読めないブランチは 1 回にする (読めば、読めないリポジトリとして除かれる)。
 // gh-pages ブランチは、Pages のサイトがあるかを確かめる前なので、あるものとして見積もる。
+// 確かめる REST の問い合わせ (gh-pages ブランチごとに 1 回) は、どちらの読み方でも送るので、どちらにも足す。
 function listed(repository) {
   const branches = branchesOf(repository);
-  const all = branches.reduce((sum, { commits }) => sum + Math.max(1, Math.ceil((commits ?? 0) / 100)), 0);
-  return { repository, branches, requests: { all, authored: branches.length } };
+  const sites = branches.filter(({ site }) => site).length;
+  const all = branches.reduce((sum, { commits }) => sum + Math.max(1, Math.ceil((commits ?? 0) / HISTORY_PAGE_SIZES[0])), 0);
+  return { repository, branches, requests: { all: all + sites, authored: branches.length + sites } };
 }
 
-// Pages のサイトがあるか。GraphQL API では分からないので、REST API で読む。リポジトリが読めなければ null。
-async function hasPagesSite(token, { owner: { login: owner }, name }) {
-  const repository = await restGet(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`);
-  return repository === null ? null : repository.has_pages === true;
+// 一覧を読むのに送った問い合わせの数 (requests) に、一覧のリポジトリ (listed) を reading の読み方で読む見積もりを足した、
+// 非公開リポジトリのコミットを数えるのに送る問い合わせの数の見積もり。読み方を決めるのに使う。
+const estimateRequests = (requests, entries, reading) => entries.reduce((sum, entry) => sum + entry.requests[reading], requests);
+
+// Pages のサイトがあるか。GraphQL API では分からないので、REST API で読む。
+// リポジトリが読めなければ (403 か 404)、サイトがあるとは確かめられないので、ないものとする。
+// GraphQL では読めるのに REST API では読めない状態が続いても、既定のブランチの分は毎回数えられ、数も実行ごとに変わらない。
+async function hasPagesSite(token, { owner: { login: owner }, name }, signal) {
+  const repository = await restGet(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`, signal);
+  return repository?.has_pages === true;
 }
 
-// items を REPOSITORY_CONCURRENCY 件まで並べて処理する。fn には、やめてよいかを返す stopped も渡す。
-// 1 つでも失敗するか、done が true を返したら、まだ始めていないものは始めない。
-// 途中のものも stopped を見て、残りのページを取らずにやめる。
-async function forEachConcurrently(items, done, fn) {
+// hasPagesSite を、リポジトリごとに 1 回だけ問い合わせるようにしたもの。軽い読み方で数え直すときは、確かめた答えを使う。
+// 答えが分かる前に失敗するか中止したら、覚えずに、次に聞かれたときにまた問い合わせる。
+function pagesSites(token) {
+  const known = new Map();
+  return async (repository, signal) => {
+    if (!known.has(repository.id)) known.set(repository.id, await hasPagesSite(token, repository, signal));
+    return known.get(repository.id);
+  };
+}
+
+// 中止したことによる失敗か、GitHub から思うように読めなかった失敗か。どちらでもなければ、コードのバグのような失敗。
+const isExpectedFailure = (error) => error instanceof FetchFailure || error?.name === 'AbortError';
+
+// items を REPOSITORY_CONCURRENCY 件まで並べて処理する。fn には、中止を知らせる signal と、残りをやめるときに呼ぶ stop も渡す。
+// 1 つでも失敗するか、stop が呼ばれたら、signal を中止する。まだ始めていないものは始めず、途中のものも signal を見てやめる。
+// 途中の問い合わせとやり直しも待たない。結果はもう決まったか、もう使わないため。
+// どれもやめてから、最初の失敗を投げる。投げたあとに問い合わせが残らないようにする。
+// 中止したあとの失敗は、中止したことによるものか、GitHub から読めなかったものなら見ない。
+// コードのバグのような失敗は、中止したあとでも、GitHub から読めなかった失敗でかくさずに投げる。
+async function forEachConcurrently(items, fn) {
   const queue = [...items];
-  let failed = false;
-  const stopped = () => failed || done();
+  const controller = new AbortController();
+  const { signal } = controller;
+  const stop = () => controller.abort();
+  let failed;
   const worker = async () => {
-    while (!stopped() && queue.length > 0) {
+    while (!signal.aborted && queue.length > 0) {
       try {
-        await fn(queue.shift(), stopped);
+        await fn(queue.shift(), signal, stop);
       } catch (error) {
-        failed = true;
-        throw error;
+        if (!signal.aborted) failed = error;
+        else if (!isExpectedFailure(error) && (failed === undefined || isExpectedFailure(failed))) failed = error;
+        stop();
+        return;
       }
     }
   };
   await Promise.all(Array.from({ length: REPOSITORY_CONCURRENCY }, worker));
+  if (failed !== undefined) throw failed;
 }
 
 // 数えているあいだに読めるものが変わったとき。途中までの数は出さない。
 const changedWhileCounting = (ja, en) => failure(bilingual(ja, en));
 
-// 読めない項目のせいで null になったコミット。本人のコミットかどうか分からず、除くと少なく数えるので、数えきれなかったことにする。
-const UNREADABLE_COMMITS = bilingual('非公開リポジトリのコミットの一部が読めませんでした', "Some commits in a private repository couldn't be read");
+// lastDay は、本人が author のコミットだけを読む最後の日 (lighterUntil)。
+const lighterReading = (lastDay) => bilingual(
+  '非公開リポジトリのコミットを、だれのコミットも読んでは数えきれなかったので、本人が author のコミットだけを読んで数えました。' +
+    `Co-authored-by に名前があるだけのコミットと、commit し直しただけのコミットは入りません。${lastDay} までは、本人が author のコミットだけを読みます`,
+  "Couldn't count the commits in private repositories by reading everyone's commits, so only the commits the user authored were read and counted. " +
+    `Commits where the user is only named in Co-authored-by, or only re-committed, aren't included. Until ${lastDay}, only the commits the user authored will be read`,
+);
 
 // since より後に push された、トークンで読める非公開リポジトリ (listed) と、一覧を読むのに送った問い合わせの数。
 // counted (GitHub がもうコミットを数えているリポジトリ) は入れない。
@@ -456,9 +532,8 @@ const UNREADABLE_COMMITS = bilingual('非公開リポジトリのコミットの
 async function activePrivateRepositories(token, { login, since, counted, budget }) {
   const repositories = new Map();
   let requests = 0;
-  let authored = 0;
   let readable = true;
-  const overBudget = () => requests + authored > budget;
+  const overBudget = () => estimateRequests(requests, [...repositories.values()], 'authored') > budget;
   const fetchPage = async (after) => {
     requests += 1;
     const { data } = await graphqlPartial(token, PRIVATE_REPOSITORIES_QUERY, { login, since, after });
@@ -484,9 +559,7 @@ async function activePrivateRepositories(token, { login, since, counted, budget 
       const old = page.nodes.findIndex((repository) => repository?.pushedAt && Date.parse(repository.pushedAt) < Date.parse(since));
       for (const repository of old === -1 ? page.nodes : page.nodes.slice(0, old)) {
         if (!repository?.pushedAt || repositories.has(repository.id) || counted.has(repository.id)) continue;
-        const entry = listed(repository);
-        repositories.set(repository.id, entry);
-        authored += entry.requests.authored;
+        repositories.set(repository.id, listed(repository));
       }
       if (old !== -1 || overBudget() || read === maxPages) return;
     }
@@ -501,31 +574,44 @@ async function activePrivateRepositories(token, { login, since, counted, budget 
 
 // 1 つのリポジトリ (listed) の、読むブランチにある、since より後に commit されたコミットを、ページごとに onCommits に渡す。
 // author があれば、そのユーザーが author のコミットだけを読む。なければ、だれのコミットも読む。
-// 読めるかどうかは、最初の履歴のページで決める。それまでに履歴か Pages のサイトが読めなければ、何も渡さずに終わり、
+// 読めるかどうかは、最初の履歴のページで決める。それまでに履歴が読めなければ、何も渡さずに終わり、
 // そのリポジトリは数えない。そのあとで読めなくなったり、ブランチが消されたりしたら、数えているあいだに変わったので失敗する。
+// Pages のサイトがあるかは hasSite (pagesSites) で確かめ、読めなければ、サイトがないものとして、gh-pages ブランチだけを読まない。
 // 読めた分を引くと、ほかのリポジトリを読むのをやめたあとで数が減り、実行ごとに数が変わることがあるため。
-// stopped が true になったら、残りのページもブランチも読まない。
-async function readRepository(token, { repository, branches }, { since, author }, stopped, onCommits) {
+// コミットには、読めない項目のせいで null になったものもある。
+// だれのコミットも読むときは、重すぎた履歴のページを、ページを小さくして読み直す (HISTORY_PAGE_SIZES)。
+// signal が中止されたら、残りのページもブランチも読まず、途中の問い合わせもやめる。
+async function readRepository(token, { repository, branches }, { since, author, hasSite, signal }, onCommits) {
   const { owner: { login: owner }, name } = repository;
+  const pageSizes = author ? HISTORY_PAGE_SIZES.slice(0, 1) : HISTORY_PAGE_SIZES;
   let first = true;
   const changed = () => changedWhileCounting(
     '非公開リポジトリのコミットを数えているあいだに、リポジトリかブランチが消されたか、名前が変わったか、読めなくなりました',
     'A private repository or branch was deleted, renamed or became unreadable while counting commits',
   );
   for (const { ref, site } of branches) {
-    if (stopped()) return;
+    if (signal.aborted) return;
     if (site) {
-      const hasSite = await hasPagesSite(token, repository);
-      if (hasSite === null) {
-        if (first) return;
-        throw changed();
-      }
-      if (!hasSite) continue;
-      if (stopped()) return;
+      if (!(await hasSite(repository, signal))) continue;
+      if (signal.aborted) return;
     }
+    // このブランチで、いま使っているページの大きさ (pageSizes の何番目か)。
+    let size = 0;
+    // after のカーソルからの 1 ページを読む。まだ小さくできるうちは、重すぎた失敗を同じ大きさではやり直さずに、小さくして読み直す。
+    const readHistory = async (after) => {
+      for (;;) {
+        const smaller = size + 1 < pageSizes.length;
+        const variables = { owner, name, ref, since, all: !author, author, first: pageSizes[size], after };
+        try {
+          return await graphqlPartial(token, HISTORY_QUERY, variables, signal, { retryTooHeavy: !smaller });
+        } catch (error) {
+          if (!(smaller && error instanceof FetchFailure && error.tooHeavy)) throw error;
+          size += 1;
+        }
+      }
+    };
     const fetchPage = async (after) => {
-      const variables = { owner, name, ref, since, all: !author, author, after };
-      const { data, unreadable } = await graphqlPartial(token, HISTORY_QUERY, variables);
+      const { data, unreadable } = await readHistory(after);
       const history = data.repository?.ref?.target?.history;
       if (history?.nodes) return history;
       // 履歴が読めていなければ応答にコミットはないので、読めない項目のエラーは、このリポジトリかブランチか履歴のもの。
@@ -536,18 +622,18 @@ async function readRepository(token, { repository, branches }, { since, author }
     for await (const history of pages(fetchPage)) {
       if (!history) return;
       first = false;
-      if (history.nodes.includes(null)) throw failure(UNREADABLE_COMMITS);
       onCommits(history.nodes);
-      if (stopped()) return;
+      if (signal.aborted) return;
     }
   }
 }
 
-// 非公開リポジトリのコミットを数えないとき。数えた結果がこれと同じなら、state.json にも残さない。
+// 非公開リポジトリのコミットを数えないとき。数えた結果がこれと同じで、数えきれなくなった日もなければ、state.json にも残さない。
 const NOT_COUNTED = { count: 0, reading: 'all' };
 
 // トークンで読める非公開リポジトリにある、コントリビューションの期間 (firstDay から lastDay) の本人のコミットの数 (count) と、
-// 読み方 (reading)。previous は前の実行の読み方。
+// 読み方 (reading)。previous は前の実行の読み方。lighterSince は、前の実行までに軽い読み方で数え直した日で、
+// まだだれのコミットも読まないあいだ (lighterUntil まで) だけ渡す。lighterOnFailure は、重すぎたときに軽い読み方で数え直すか。
 // GitHub のドキュメント (Profile contributions reference) にある、コントリビューションに数える決まりで数える。
 // - フォークではないリポジトリの、既定のブランチと、Pages のサイトがあるリポジトリの gh-pages ブランチのコミット
 // - 本人が author か、Co-authored-by に名前があるか、rebase などで commit し直した人 (committer)。
@@ -564,9 +650,18 @@ const NOT_COUNTED = { count: 0, reading: 'all' };
 // 本人が author のコミットだけを読む (Co-authored-by に名前があるだけのコミットと、commit し直しただけのコミットは数えない)。
 // それでも超えるなら読まずに 0 にする。前の実行より重い読み方にするのは、見積もりが HEAVIER_READING_REQUESTS までのときだけ。
 // トークンの持ち主が本人でないときと、トークンで一覧が読めないときも 0 にする。どれも実行ごとにはまず変わらないので、カードの数も変わらない。
-// 数えきれないとき (やり直しても続くタイムアウトや回数の上限、数えているあいだに読めるものが変わったときなど) は失敗する。
+// 読めない項目のせいで null になったコミットは除いて数える。
+// 数えきれないとき (やり直しても続くタイムアウトや回数の上限、数えているあいだに読めるものが変わったときなど) は FetchFailure で失敗する。
 // そのときは、呼ぶ側 (fetchAccount) で前の実行の数を使う。
-async function fetchPrivateCommits(login, token, { id, firstDay, lastDay, restricted }, previous) {
+// ただし lighterOnFailure なら、だれのコミットも読んでは重すぎて (tooHeavy) 数えきれなかったとき、
+// 同じ一覧のまま、本人が author のコミットだけを読んで数え直す。それでも数えきれなければ、そのときの失敗で失敗する。
+// 数え直したら、その日を lighterSince として返す。そこから LIGHTER_READING_DAYS 日あとまでは、だれのコミットも読まない。
+// lighterOnFailure は、前の実行の数を使えないときと、前の実行がだれのコミットも読んでいないとき (fetchAccount)。
+// だれのコミットも読むと毎回タイムアウトするリポジトリがあっても、前の実行の数が古くなったあと、0 のままにならない。
+// 前の実行がだれのコミットも読んでいて、その数を使えるあいだは数え直さない。一時的な失敗で、カードの数が軽い読み方の数に下がらないようにするため。
+// 回数の上限や、数えているあいだに読めるものが変わったときは、軽い読み方にしても数えられないか、数が下がるだけなので、数え直さない。
+async function fetchPrivateCommits(login, token, period, { previous, lighterSince, lighterOnFailure }, warn) {
+  const { id, firstDay, lastDay: today } = period;
   // 既定のトークンは GitHub App のトークン (ghs_ で始まる) で、本人のトークンではない。問い合わせずに数えない。
   if (token.startsWith('ghs_')) return NOT_COUNTED;
   // ほかのトークンでも、viewer が読めないか、本人ではないアカウントなら、一覧も読まずに数えない。
@@ -581,9 +676,32 @@ async function fetchPrivateCommits(login, token, { id, firstDay, lastDay, restri
   const active = await activePrivateRepositories(token, { login, since, counted, budget: readingLimit('authored', previous) });
   if (!active) return NOT_COUNTED;
   const { repositories, requests } = active;
-  const estimate = (reading) => requests + repositories.reduce((sum, entry) => sum + entry.requests[reading], 0);
-  const reading = ['all', 'authored'].find((candidate) => estimate(candidate) <= readingLimit(candidate, previous)) ?? 'none';
-  if (reading === 'none') return { count: 0, reading };
+  const fits = (candidate) => estimateRequests(requests, repositories, candidate) <= readingLimit(candidate, previous);
+  const reading = (lighterSince ? ['authored'] : ['all', 'authored']).find(fits) ?? 'none';
+  // だれのコミットも読まないあいだは、軽い読み方で数え直した日を残す。見積もりが上限を超えて読まない日も残す。
+  // 消すと、見積もりが下がった次の日に、日数がたつ前に、だれのコミットも読んで、また重すぎて数え直すことになるため。
+  const keepLighter = (result) => (lighterSince ? { ...result, lighterSince } : result);
+  if (reading === 'none') return keepLighter({ count: 0, reading });
+  const hasSite = pagesSites(token);
+  const countAs = (candidate) => countCommits(token, repositories, { ...period, since, hasSite, reading: candidate });
+  if (reading === 'authored') return keepLighter(await countAs(reading));
+  if (!lighterOnFailure) return countAs(reading);
+  try {
+    return await countAs(reading);
+  } catch (error) {
+    if (!(error instanceof FetchFailure && error.tooHeavy)) throw error;
+    // 本人が author のコミットだけを読む見積もりは、だれのコミットも読む見積もりより多くならず、上限も低くならないので、
+    // だれのコミットも読む見積もりが上限までなら、確かめなくても上限まで。
+    const result = await countAs('authored');
+    warn(`${lighterReading(lighterUntil(today))}\n${error.message}`);
+    return { ...result, lighterSince: today };
+  }
+}
+
+// 一覧のリポジトリ (listed) にある、コントリビューションの期間 (firstDay から lastDay) の本人のコミットの数 (count) を、
+// reading の読み方 (all か authored) で数えて、読み方と一緒に返す。restricted より多くはしない。
+// Pages のサイトがあるかは hasSite (pagesSites) で確かめる。
+async function countCommits(token, repositories, { id, firstDay, lastDay, restricted, since, hasSite, reading }) {
   const author = reading === 'all' ? null : { id };
   const isContribution = (commit) => {
     const day = commit.author?.date?.slice(0, 10);
@@ -598,33 +716,104 @@ async function fetchPrivateCommits(login, token, { id, firstDay, lastDay, restri
   // 読めるかどうかは最初のページで決まり、あとから引くことはないので、届いたところでやめても数は変わらない。
   // コミットはリポジトリごとに数えるので、リポジトリどうしでは重ならず、足すだけでよい。
   let total = 0;
-  await forEachConcurrently(repositories, () => total >= restricted, async (entry, stopped) => {
-    const found = new Set();
-    await readRepository(token, entry, { since, author }, stopped, (commits) => {
-      for (const commit of commits) {
-        if (!isContribution(commit) || found.has(commit.oid)) continue;
-        found.add(commit.oid);
-        total += 1;
-      }
+  try {
+    await forEachConcurrently(repositories, async (entry, signal, stop) => {
+      const found = new Set();
+      await readRepository(token, entry, { since, author, hasSite, signal }, (commits) => {
+        for (const commit of commits) {
+          // 読めない項目のせいで null になったコミットは、本人のコミットかどうか分からないので除く。
+          // 少なく数えることになるが、読めないリポジトリと同じく、毎回同じコミットが読めないなら、数は実行ごとに変わらない。
+          // 読めないのは組織の SSO などで、知らせても本人には直せないので、読めないリポジトリと同じく知らせない。
+          if (!commit || !isContribution(commit) || found.has(commit.oid)) continue;
+          found.add(commit.oid);
+          total += 1;
+        }
+        // restricted に届いたら、数は決まったので、残りは読まない。
+        if (total >= restricted) stop();
+      });
     });
-  });
+  } catch (error) {
+    // 数えた分はあとから引かないので、restricted に届いたら、数は restricted に決まる。
+    // 届いたあとの失敗は、届いたところで読むのをやめるので見ない (forEachConcurrently)。
+    // 失敗のあとで、もう届いていた応答で restricted に届いたときも、応答の順番で数が変わらないよう、失敗は見ない。
+    if (!(error instanceof FetchFailure && total >= restricted)) throw error;
+  }
   return { count: Math.min(total, restricted), reading };
 }
 
-// 前の実行の state.json に残した、非公開リポジトリのコミットの数と読み方。形が違えば、残していないものとする。
-const isPrivateCommits = (value) =>
-  Number.isSafeInteger(value?.count) && value.count >= 0 && READINGS.includes(value.reading);
+// 前の実行の state.json に残した、非公開リポジトリのコミットの数と読み方と、数えた人 (userId) と、数えきれなくなった日 (failedSince) と、
+// 軽い読み方で数え直した日 (lighterSince)。
+// 形が違うか、ほかのユーザーのもの (username を変えたときなど) なら、残していないものとする。
+// ほかのユーザーの数を、数えきれなかった日に足さないため。
+const isOptionalDate = (value) => value === undefined || isDate(value);
+const isPrivateCommits = (value, userId) =>
+  Number.isSafeInteger(value?.count) && value.count >= 0 && READINGS.includes(value.reading) && value.userId === userId &&
+  isOptionalDate(value.failedSince) && isOptionalDate(value.lighterSince);
 
-const privateCommitsFallback = (recorded) =>
-  recorded
-    ? bilingual(
-      '非公開リポジトリのコミットを数えきれなかったので、前の実行で数えた数を使います。次の実行で数え直します',
-      "Couldn't count the commits in private repositories, so the count from the previous run is used. They will be counted again on the next run",
-    )
-    : bilingual(
+// 本人が author のコミットだけを読む最後の日。軽い読み方で数え直した日 (lighterSince) から LIGHTER_READING_DAYS 日あと。
+const lighterUntil = (lighterSince) => addDays(lighterSince, LIGHTER_READING_DAYS);
+
+// 数えきれなかった日に、前の実行で数えた数を使うのは、数えきれなくなった日 (failedSince) から KEEP_PRIVATE_COMMITS_DAYS 日あとまで。
+// それより長く数えきれないと、前の数には、そのあとに増えたコミットも、期間から外れたコミットも入っていないので、使わずに 0 にする。
+// 数えきれない日が続いても、カードの数が下がって気づける。
+// 使えなくなった日からは、だれのコミットも読んでは重すぎて数えきれなければ、本人が author のコミットだけを読んで数える (fetchPrivateCommits)。
+// 数えた日ではなく、数えきれなくなった日を残す。数えた日を残すと、カードが変わらない日も state.json が変わり、毎日コミットされるため。
+export const KEEP_PRIVATE_COMMITS_DAYS = 7;
+
+// 今日数えきれなかったときに、前の実行の数 (previous) を使うかどうか。数えきれなくなった日 (failedSince) と、使える最後の日 (lastUsed) と、
+// 今日使えるか (usable)。前の実行で数えられていれば、今日が数えきれなくなった日になる。
+function previousUse(previous, today) {
+  const failedSince = previous.failedSince ?? today;
+  const lastUsed = addDays(failedSince, KEEP_PRIVATE_COMMITS_DAYS);
+  return { failedSince, lastUsed, usable: lastUsed >= today };
+}
+
+// 数えきれなかった日の、非公開リポジトリのコミットの数と読み方と数えきれなくなった日 (privateCommits) と、知らせる文 (message)。
+// previous は前の実行の state.json に残した数で、なければ undefined。use は previousUse で決めた、前の実行の数の使い方。
+// 読み方と軽い読み方で数え直した日 (lighterSince) は、次の実行の読み方を決めるのに使うので、前の実行のまま残す。
+function privateCommitsFallback(previous, use, restricted) {
+  if (previous === undefined) {
+    const message = bilingual(
       '非公開リポジトリのコミットを数えきれなかったので、今回は数えません。次の実行で数え直します',
       "Couldn't count the commits in private repositories, so they aren't counted this time. They will be counted again on the next run",
     );
+    return { privateCommits: NOT_COUNTED, message };
+  }
+  const { failedSince, lastUsed, usable } = use;
+  if (!usable) {
+    const message = bilingual(
+      `非公開リポジトリのコミットを数えきれなかったので、今回は数えません。${failedSince} から ${KEEP_PRIVATE_COMMITS_DAYS} 日を過ぎても数えきれず、前に数えた数は古くなりました。次の実行で数え直します`,
+      `Couldn't count the commits in private repositories, so they aren't counted this time. They still couldn't be counted more than ${KEEP_PRIVATE_COMMITS_DAYS} days after ${failedSince}, so the previous count is out of date. They will be counted again on the next run`,
+    );
+    // 数えきれなくなった日も変えない。
+    return { privateCommits: { ...previous, count: 0, failedSince }, message };
+  }
+  const message = bilingual(
+    `非公開リポジトリのコミットを数えきれなかったので、前に数えた数を使います (${lastUsed} まで)。次の実行で数え直します`,
+    `Couldn't count the commits in private repositories, so the previous count is used (until ${lastUsed}). They will be counted again on the next run`,
+  );
+  return { privateCommits: { ...previous, count: Math.min(previous.count, restricted), failedSince }, message };
+}
+
+// 読み方が none に変わった日に知らせる。カードの数が、本人の活動とは関係なく下がるため。
+const NOT_READING = bilingual(
+  '非公開リポジトリの読む量の見積もりが上限を超えたので、非公開リポジトリのコミットを数えるのをやめました。' +
+    '見積もりには、ほかの人のコミットも入ります。見積もりが減れば、また数えます',
+  'The estimated amount to read in private repositories went over the limit, so their commits are no longer counted. ' +
+    "The estimate includes other people's commits too. They will be counted again when the estimate goes down",
+);
+
+// 見積もりで、だれのコミットも読む読み方から、本人が author のコミットだけを読む読み方に変わった日に知らせる。
+// カードの数が、本人の活動とは関係なく下がり、GitHub の数え方の数より少なくなるため。
+// 重すぎて数え直した日は、数え直したことを知らせる (lighterReading) ので、これは知らせない。
+const AUTHORED_READING = bilingual(
+  '非公開リポジトリの読む量の見積もりが上限を超えたので、非公開リポジトリのコミットは、本人が author のコミットだけを読んで数えます。' +
+    'Co-authored-by に名前があるだけのコミットと、commit し直しただけのコミットは入らないので、GitHub の数え方より少なくなることがあります。' +
+    '見積もりには、ほかの人のコミットも入ります。見積もりが減れば、また、だれのコミットも読んで数えます',
+  'The estimated amount to read in private repositories went over the limit, so only the commits the user authored are counted in them. ' +
+    "Commits where the user is only named in Co-authored-by, or only re-committed, aren't included, so the count can be lower than GitHub's. " +
+    "The estimate includes other people's commits too. Everyone's commits will be read and counted again when the estimate goes down",
+);
 
 // privateCommits は、前の実行が返した privateCommits (state.json に残したもの)。warn は、カードは作れるが知らせたいことを出す。
 export async function fetchAccount(login, token, { privateCommits: recorded, warn = console.warn } = {}) {
@@ -641,18 +830,35 @@ export async function fetchAccount(login, token, { privateCommits: recorded, war
   }
 
   // 非公開リポジトリのコミットは、Private contributions がオン (非公開の活動の数が 0 より大きい) のときだけ数える。
-  // 数えきれないときは、前の実行の数を使う。0 や途中まで数えた数にすると実行ごとに数が増えたり減ったりし、
+  // 数えきれないときは、前の実行の数を使う (privateCommitsFallback)。0 や途中まで数えた数にすると実行ごとに数が増えたり減ったりし、
   // 止まると、1 つのリポジトリが読めつづけないだけで、カード全体がずっと更新されなくなるため。
+  // ただし、コードのバグなど、GitHub から読めなかったのではない失敗 (FetchFailure でないもの) は、前の実行の数でかくさずに止まる。
+  // 非公開リポジトリを数えるのは本人のトークンを渡したときだけなので、止まって困るのは本人だけで、すぐ気づける。
   const restricted = collection.restrictedContributionsCount;
-  const previous = isPrivateCommits(recorded) ? recorded : NOT_COUNTED;
+  const { id } = profile.user;
+  const previous = isPrivateCommits(recorded, id) ? recorded : undefined;
+  const use = previous && previousUse(previous, today);
   const countPrivateCommits = async () => {
     if (!(restricted > 0)) return NOT_COUNTED;
-    const period = { id: profile.user.id, firstDay: firstDate(calendar), lastDay: today, restricted };
+    const period = { id, firstDay: firstDate(calendar), lastDay: today, restricted };
+    const readings = {
+      previous: previous?.reading ?? NOT_COUNTED.reading,
+      // 軽い読み方で数え直した日から決まった日数のあいだは、だれのコミットも読まない。
+      lighterSince: previous?.lighterSince && lighterUntil(previous.lighterSince) >= today ? previous.lighterSince : undefined,
+      // 前の実行がだれのコミットも読んでいなければ、軽い読み方で数え直しても、前の実行より軽い読み方の数にはならない。
+      lighterOnFailure: !use?.usable || previous.reading !== 'all',
+    };
     try {
-      return await fetchPrivateCommits(login, token, period, previous.reading);
+      const counted = await fetchPrivateCommits(login, token, period, readings, warn);
+      if (counted.reading === 'none' && previous?.reading !== 'none') warn(NOT_READING);
+      // 軽い読み方で数え直した日がある (lighterSince) ときは、見積もりで変わったのではない。
+      if (counted.reading === 'authored' && readings.previous === 'all' && counted.lighterSince === undefined) warn(AUTHORED_READING);
+      return counted;
     } catch (error) {
-      warn(`${privateCommitsFallback(previous !== NOT_COUNTED)}\n${error.message}`);
-      return { ...previous, count: Math.min(previous.count, restricted) };
+      if (!(error instanceof FetchFailure)) throw error;
+      const { privateCommits, message } = privateCommitsFallback(previous, use, restricted);
+      warn(`${message}\n${error.message}`);
+      return privateCommits;
     }
   };
 
@@ -665,7 +871,8 @@ export async function fetchAccount(login, token, { privateCommits: recorded, war
     fetchCount('pullRequests', login, token),
     fetchCount('issues', login, token),
   ]);
-  const notCounted = privateCommits.count === NOT_COUNTED.count && privateCommits.reading === NOT_COUNTED.reading;
+  const notCounted = privateCommits.count === NOT_COUNTED.count && privateCommits.reading === NOT_COUNTED.reading &&
+    privateCommits.failedSince === undefined;
   return {
     login,
     // 草の日付での今日。連続記録とキャラクターの開始日は、この日付で数える。
@@ -675,9 +882,10 @@ export async function fetchAccount(login, token, { privateCommits: recorded, war
     // Private contributions がオンで、トークンの持ち主が本人なら、トークンで読める非公開リポジトリの分を、リポジトリごとに数えて足す。
     // 読めない非公開リポジトリの分は入らない。
     totalCommits: collection.totalCommitContributions + privateCommits.count,
-    // state.json に残して、次の実行の fetchAccount に渡す、非公開リポジトリのコミットの数と読み方。
-    // 数えないときと同じなら undefined で、残さない。
-    privateCommits: notCounted ? undefined : privateCommits,
+    // state.json に残して、次の実行の fetchAccount に渡す、非公開リポジトリのコミットの数と読み方と数えた人 (userId)。
+    // 数えきれなかった日は、数えきれなくなった日 (failedSince) も残す。軽い読み方で数え直したら、その日 (lighterSince) も、
+    // だれのコミットも読まないあいだ残す。数えないときと同じなら undefined で、残さない。
+    privateCommits: notCounted ? undefined : { ...privateCommits, userId: id },
     // 言語を数えるリポジトリ (フォークを除いたすべて)。
     repositories,
     totalPullRequests,

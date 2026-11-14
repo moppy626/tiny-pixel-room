@@ -19,7 +19,8 @@ export function recordExp(state, exp) {
   return { ...state, maxExp: Math.max(state.maxExp, exp) };
 }
 
-// 非公開リポジトリのコミットの数と読み方 (github.mjs の fetchAccount が返す privateCommits) を残す。
+// 非公開リポジトリのコミットの数と読み方と数えた人、数えきれなかった日は数えきれなくなった日、
+// 軽い読み方で数え直したあとはその日 (github.mjs の fetchAccount が返す privateCommits) を残す。
 // 次の実行で fetchAccount に渡し、数えきれなかった日に前の数を使うのと、読み方を実行ごとに揺らさないのに使う。
 // 育ちには関係しないので、キャラクターを変えても引き継ぐ。undefined なら残さない。
 export function recordPrivateCommits(state, privateCommits) {

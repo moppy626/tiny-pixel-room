@@ -505,20 +505,26 @@ for (const character of ['turnip', 'cactus']) {
   test(`非公開リポジトリのコミットを数えきれなかった日も、カードは更新し、前の実行で数えた数を state.json に残す: character ${character}`, (t) => {
     const dir = tempDir(t);
     mkdirSync(join(dir, 'tiny-pixel-room'));
-    const privateCommits = { count: 5, reading: 'authored' };
+    const privateCommits = { count: 5, reading: 'authored', userId: 'U_fake' };
     const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: FAKE_EXP, privateCommits };
     writeFileSync(join(dir, 'tiny-pixel-room/state.json'), JSON.stringify(state));
+    // 偽の GitHub の今日 (UTC の今日) が、数えきれなくなった日になる。動かしているあいだに日付が変わってもよいよう、前後の日を取る。
+    const utcToday = () => new Date().toISOString().slice(0, 10);
+    const before = utcToday();
     const result = runAction(dir, { character, commit: 'false' }, { FAKE_GITHUB: 'private-error' });
+    const after = utcToday();
     assertSucceeded(result);
-    assert.match(result.stdout, /::warning::非公開リポジトリのコミットを数えきれなかったので、前の実行で数えた数を使います/);
+    assert.match(result.stdout, /::warning::非公開リポジトリのコミットを数えきれなかったので、前に数えた数を使います/);
     const saved = JSON.parse(readFileSync(join(dir, 'tiny-pixel-room/state.json'), 'utf8'));
     assert.equal(saved.character, character);
-    assert.deepEqual(saved.privateCommits, privateCommits);
+    const { failedSince, ...kept } = saved.privateCommits;
+    assert.deepEqual(kept, privateCommits);
+    assert.ok([before, after].includes(failedSince));
   });
 }
 
 test('非公開リポジトリのコミットを数えないなら、state.json に残した数を消す', (t) => {
   const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: FAKE_EXP };
-  const { saved } = runWithState(t, { ...state, privateCommits: { count: 5, reading: 'all' } });
+  const { saved } = runWithState(t, { ...state, privateCommits: { count: 5, reading: 'all', userId: 'U_fake' } });
   assert.deepEqual(saved, state);
 });

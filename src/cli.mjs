@@ -43,7 +43,7 @@ if (inputError) exitWith(inputError);
 
 // GitHub API のエラー (github.mjs) は、日本語と英語の 2 行の文になっている。
 try {
-  const account = await fetchAccount(values.user, process.env.GITHUB_TOKEN, { warn: console.warn });
+  const account = await fetchAccount(values.user, process.env.GITHUB_TOKEN);
   const cards = buildCards(account, {
     character,
     since: values.since ?? account.today,

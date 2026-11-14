@@ -85,9 +85,9 @@ test('初めて使う日の EXP も、最高 EXP として覚える', () => {
   assert.equal(recordExp(nextState(null, 'turnip', '2026-11-08'), 42).maxExp, 42);
 });
 
-test('非公開リポジトリのコミットの数と読み方を残し、なければ消す', () => {
+test('非公開リポジトリのコミットの数と読み方と数えた人と数えきれなくなった日を残し、なければ消す', () => {
   const state = { version: 1, character: 'turnip', since: '2026-05-01', maxExp: 0 };
-  const privateCommits = { count: 5, reading: 'authored' };
+  const privateCommits = { count: 5, reading: 'authored', userId: 'U_octocat', failedSince: '2026-05-08' };
   assert.deepEqual(recordPrivateCommits(state, privateCommits), { ...state, privateCommits });
   assert.deepEqual(recordPrivateCommits({ ...state, privateCommits }, undefined), state);
 });
